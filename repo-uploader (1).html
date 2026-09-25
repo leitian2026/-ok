@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>仓库直传</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  :root{
+    --paper:#f6f5f1;
+    --ink:#1c211d;
+    --ink-soft:#5a6058;
+    --line:#dcdad2;
+    --teal:#2f6f62;
+    --teal-deep:#204b42;
+    --amber:#c9852c;
+    --danger:#b3452f;
+    --ok:#2f6f62;
+    --card:#ffffff;
+    --radius:14px;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-sizing: border-box;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#14171a;
+      --ink:#e9ece7;
+      --ink-soft:#9aa39a;
+      --line:#2b302c;
+      --card:#1c2023;
+      --teal:#5fa393;
+      --teal-deep:#8ec4b6;
+      --amber:#e0a559;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#14171a;
+    --ink:#e9ece7;
+    --ink-soft:#9aa39a;
+    --line:#2b302c;
+    --card:#1c2023;
+    --teal:#5fa393;
+    --teal-deep:#8ec4b6;
+    --amber:#e0a559;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;}
+  .wrap{
+    max-width:520px;
+    margin:0 auto;
+    padding:24px 18px 40px;
+  }
+  header{
+    padding-top: env(safe-area-inset-top, 0px);
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    margin-bottom:22px;
+  }
+  h1{
+    font-size:22px;
+    font-weight:700;
+    letter-spacing:-0.02em;
+    margin:0;
+  }
+  .repo-tag{
+    font-size:13px;
+    color:var(--ink-soft);
+    cursor:pointer;
+    text-decoration:underline;
+    text-underline-offset:3px;
+    background:none;
+    border:none;
+    padding:0;
+    font-family:inherit;
+  }
+  .card{
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:18px;
+    margin-bottom:16px;
+  }
+  .drop{
+    border:1.5px dashed var(--line);
+    border-radius:var(--radius);
+    padding:38px 18px;
+    text-align:center;
+    cursor:pointer;
+    transition:border-color .15s ease, background .15s ease;
+  }
+  .drop:active, .drop.hover{
+    border-color:var(--teal);
+    background:color-mix(in srgb, var(--teal) 6%, transparent);
+  }
+  .drop .big{
+    font-size:17px;
+    font-weight:600;
+    margin-bottom:6px;
+  }
+  .drop .small{
+    font-size:13px;
+    color:var(--ink-soft);
+  }
+  input[type=file]{display:none;}
+  label.field{
+    display:block;
+    font-size:12px;
+    color:var(--ink-soft);
+    margin:0 0 5px;
+  }
+  input[type=text], input[type=password]{
+    width:100%;
+    padding:11px 12px;
+    border-radius:9px;
+    border:1px solid var(--line);
+    background:var(--paper);
+    color:var(--ink);
+    font-size:14px;
+    margin-bottom:14px;
+  }
+  input[type=text]:focus, input[type=password]:focus{
+    outline:2px solid var(--teal);
+    outline-offset:1px;
+  }
+  button.primary{
+    width:100%;
+    background:var(--teal);
+    color:#fff;
+    border:none;
+    padding:13px;
+    border-radius:9px;
+    font-size:15px;
+    font-weight:600;
+    cursor:pointer;
+  }
+  button.primary:active{background:var(--teal-deep);}
+  button.ghost{
+    width:100%;
+    background:none;
+    border:1px solid var(--line);
+    color:var(--ink-soft);
+    padding:10px;
+    border-radius:9px;
+    font-size:13px;
+    margin-top:8px;
+    cursor:pointer;
+  }
+  .status-line{
+    font-size:12px;
+    color:var(--ink-soft);
+    margin-top:10px;
+    min-height:16px;
+  }
+  .log{
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+  }
+  .log-item{
+    display:flex;
+    align-items:flex-start;
+    gap:10px;
+    padding:10px 12px;
+    border:1px solid var(--line);
+    border-radius:10px;
+    font-size:13px;
+    background:var(--paper);
+  }
+  .log-item .icon{
+    flex:0 0 auto;
+    width:18px;
+    text-align:center;
+    line-height:1.4;
+  }
+  .log-item .body{flex:1; min-width:0;}
+  .log-item .path{
+    word-break:break-all;
+    font-size:12.5px;
+  }
+  .log-item .note{
+    color:var(--ink-soft);
+    font-size:11.5px;
+    margin-top:2px;
+  }
+  .log-item.ok{border-color:color-mix(in srgb, var(--ok) 40%, var(--line));}
+  .log-item.err{border-color:color-mix(in srgb, var(--danger) 45%, var(--line));}
+  .log-item.pending{opacity:.6;}
+  .ambiguous{
+    display:flex;
+    flex-wrap:wrap;
+    gap:6px;
+    margin-top:8px;
+  }
+  .ambiguous button{
+    font-size:12px;
+    padding:6px 10px;
+    border-radius:7px;
+    border:1px solid var(--teal);
+    background:none;
+    color:var(--teal);
+    cursor:pointer;
+    font-family:inherit;
+  }
+  .hidden{display:none !important;}
+  .empty-hint{
+    font-size:13px;
+    color:var(--ink-soft);
+    text-align:center;
+    padding:20px 0;
+  }
+  .section-title{
+    font-size:13px;
+    color:var(--ink-soft);
+    margin:0 0 10px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>仓库直传</h1>
+    <button class="repo-tag" id="repoTag" onclick="showSettings()">未连接仓库</button>
+  </header>
+
+  <!-- 设置面板 -->
+  <div class="card" id="settingsCard">
+    <p class="section-title">连接一个仓库（信息只保存在本机浏览器）</p>
+    <label class="field">Personal Access Token</label>
+    <input type="password" id="inToken" placeholder="github_pat_ 或 ghp_ 开头">
+    <label class="field">仓库（owner/repo）</label>
+    <input type="text" id="inRepo" placeholder="leitian2026/-2026">
+    <button class="ghost" onclick="browseRepos()" style="margin:-6px 0 14px;">浏览我的仓库</button>
+    <div class="log" id="repoList" style="margin-bottom:14px;"></div>
+    <label class="field">分支</label>
+    <input type="text" id="inBranch" placeholder="main" value="main">
+    <button class="primary" onclick="saveSettings()">连接并读取仓库结构</button>
+    <div class="status-line" id="settingsStatus"></div>
+  </div>
+
+  <!-- 上传区 -->
+  <div class="card hidden" id="uploadCard">
+    <div class="drop" id="dropZone" onclick="document.getElementById('fileInput').click()">
+      <div class="big">选择文件上传</div>
+      <div class="small">支持任意文件、任意数量，压缩包会自动展开</div>
+    </div>
+    <input type="file" id="fileInput" multiple>
+    <div class="status-line" id="uploadStatus"></div>
+    <button class="ghost" onclick="refreshTree()">重新读取仓库结构</button>
+  </div>
+
+  <!-- 日志 -->
+  <div class="card hidden" id="logCard">
+    <p class="section-title">上传记录</p>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let state = {
+  token:'', owner:'', repo:'', branch:'main',
+  pathSet:new Set(),          // 仓库里已存在的完整路径
+  pathShaMap:new Map(),       // path -> sha
+  basenameMap:new Map(),      // 文件名(不含目录) -> [完整路径,...]
+};
+
+function loadSettings(){
+  try{
+    const raw = localStorage.getItem('repoUploaderCfg');
+    if(!raw) return false;
+    const cfg = JSON.parse(raw);
+    state.token = cfg.token||''; state.owner = cfg.owner||''; state.repo = cfg.repo||''; state.branch = cfg.branch||'main';
+    return !!(state.token && state.owner && state.repo);
+  }catch(e){ return false; }
+}
+function persistSettings(){
+  try{
+    localStorage.setItem('repoUploaderCfg', JSON.stringify({token:state.token, owner:state.owner, repo:state.repo, branch:state.branch}));
+  }catch(e){}
+}
+
+function showSettings(){
+  $('settingsCard').classList.remove('hidden');
+  $('inToken').value = state.token;
+  $('inRepo').value = state.owner && state.repo ? `${state.owner}/${state.repo}` : '';
+  $('inBranch').value = state.branch || 'main';
+}
+
+async function browseRepos(){
+  const token = $('inToken').value.trim();
+  const listEl = $('repoList');
+  if(!token){
+    listEl.innerHTML = '<div class="log-item err"><div class="icon">❌</div><div class="body"><div class="note">先填 Token 再浏览仓库</div></div></div>';
+    return;
+  }
+  listEl.innerHTML = '<div class="log-item pending"><div class="icon">⏳</div><div class="body"><div class="note">正在读取仓库列表…</div></div></div>';
+  try{
+    const res = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member', {
+      headers:{'Authorization': `token ${token}`, 'Accept':'application/vnd.github+json'}
+    });
+    if(!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    const repos = await res.json();
+    if(!Array.isArray(repos) || repos.length === 0){
+      listEl.innerHTML = '<div class="log-item err"><div class="icon">❌</div><div class="body"><div class="note">没有读取到仓库，检查 token 权限</div></div></div>';
+      return;
+    }
+    listEl.innerHTML = '';
+    repos.forEach(r=>{
+      const el = document.createElement('div');
+      el.className = 'log-item ok';
+      el.style.cursor = 'pointer';
+      el.innerHTML = `<div class="icon">${r.private?'🔒':'📦'}</div><div class="body"><div class="path mono">${escapeHtml(r.full_name)}</div><div class="note">默认分支 ${escapeHtml(r.default_branch||'main')}</div></div>`;
+      el.onclick = ()=>{
+        $('inRepo').value = r.full_name;
+        $('inBranch').value = r.default_branch || 'main';
+        listEl.innerHTML = '';
+      };
+      listEl.appendChild(el);
+    });
+  }catch(e){
+    listEl.innerHTML = `<div class="log-item err"><div class="icon">❌</div><div class="body"><div class="note">读取失败：${escapeHtml(e.message)}</div></div></div>`;
+  }
+}
+
+async function saveSettings(){
+  const token = $('inToken').value.trim();
+  const repoFull = $('inRepo').value.trim();
+  const branch = $('inBranch').value.trim() || 'main';
+  const statusEl = $('settingsStatus');
+  if(!token || !repoFull.includes('/')){
+    statusEl.textContent = '请填写 Token，以及 owner/repo 格式的仓库名';
+    statusEl.style.color = 'var(--danger)';
+    return;
+  }
+  const [owner, repo] = repoFull.split('/');
+  state.token = token; state.owner = owner; state.repo = repo; state.branch = branch;
+  statusEl.style.color = 'var(--ink-soft)';
+  statusEl.textContent = '正在连接…';
+  try{
+    await fetchTree();
+    persistSettings();
+    statusEl.textContent = '';
+    $('settingsCard').classList.add('hidden');
+    $('uploadCard').classList.remove('hidden');
+    $('logCard').classList.remove('hidden');
+    updateRepoTag();
+  }catch(e){
+    statusEl.textContent = '连接失败：' + e.message;
+    statusEl.style.color = 'var(--danger)';
+  }
+}
+
+function updateRepoTag(){
+  $('repoTag').textContent = `${state.owner}/${state.repo} · ${state.branch}`;
+}
+
+async function ghFetch(url, options={}){
+  const res = await fetch(url, {
+    ...options,
+    headers:{
+      'Authorization': `token ${state.token}`,
+      'Accept':'application/vnd.github+json',
+      ...(options.headers||{})
+    }
+  });
+  if(!res.ok){
+    let msg = res.status + ' ' + res.statusText;
+    try{ const j = await res.json(); if(j.message) msg = j.message; }catch(e){}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+async function fetchTree(){
+  const data = await ghFetch(`https://api.github.com/repos/${state.owner}/${state.repo}/git/trees/${encodeURIComponent(state.branch)}?recursive=1`);
+  state.pathSet = new Set();
+  state.pathShaMap = new Map();
+  state.basenameMap = new Map();
+  (data.tree||[]).forEach(item=>{
+    if(item.type !== 'blob') return;
+    state.pathSet.add(item.path);
+    state.pathShaMap.set(item.path, item.sha);
+    const base = item.path.split('/').pop();
+    if(!state.basenameMap.has(base)) state.basenameMap.set(base, []);
+    state.basenameMap.get(base).push(item.path);
+  });
+}
+
+async function refreshTree(){
+  $('uploadStatus').textContent = '正在重新读取仓库结构…';
+  try{
+    await fetchTree();
+    $('uploadStatus').textContent = `已读取，仓库共有 ${state.pathSet.size} 个文件`;
+  }catch(e){
+    $('uploadStatus').textContent = '读取失败：' + e.message;
+  }
+}
+
+// ---- 路径匹配 ----
+function resolveTarget(literalRelPath, baseName){
+  if(literalRelPath && state.pathSet.has(literalRelPath)){
+    return {type:'exact', path: literalRelPath};
+  }
+  const matches = state.basenameMap.get(baseName) || [];
+  if(matches.length === 1){
+    return {type:'byname', path: matches[0]};
+  }
+  if(matches.length === 0){
+    return {type:'new', path: literalRelPath || baseName};
+  }
+  return {type:'ambiguous', candidates: matches, fallback: literalRelPath || baseName};
+}
+
+function arrayBufferToBase64(buffer){
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  for(let i=0;i<bytes.length;i+=chunk){
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+  }
+  return btoa(binary);
+}
+
+// ---- 日志 UI ----
+function addLogItem(id, path, statusText, cls){
+  const el = document.createElement('div');
+  el.className = 'log-item ' + cls;
+  el.id = 'log-' + id;
+  el.innerHTML = `<div class="icon">${cls==='ok'?'✅':cls==='err'?'❌':'⏳'}</div>
+    <div class="body"><div class="path mono">${escapeHtml(path)}</div><div class="note">${escapeHtml(statusText)}</div></div>`;
+  $('log').prepend(el);
+  return el;
+}
+function updateLogItem(el, statusText, cls){
+  el.className = 'log-item ' + cls;
+  el.querySelector('.icon').textContent = cls==='ok'?'✅':cls==='err'?'❌':'⏳';
+  el.querySelector('.note').textContent = statusText;
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---- 上传核心 ----
+async function uploadOne(path, arrayBuffer, noteExtra){
+  const id = 'u' + Math.random().toString(36).slice(2);
+  const el = addLogItem(id, path, noteExtra ? noteExtra + ' · 上传中…' : '上传中…', 'pending');
+  try{
+    const sha = state.pathShaMap.get(path);
+    const body = {
+      message: `上传 ${path}（手机直传工具）`,
+      content: arrayBufferToBase64(arrayBuffer),
+      branch: state.branch
+    };
+    if(sha) body.sha = sha;
+    const data = await ghFetch(`https://api.github.com/repos/${state.owner}/${state.repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}`, {
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if(data.content && data.content.sha){
+      state.pathShaMap.set(path, data.content.sha);
+      state.pathSet.add(path);
+      const base = path.split('/').pop();
+      if(!state.basenameMap.has(base)) state.basenameMap.set(base, []);
+      if(!state.basenameMap.get(base).includes(path)) state.basenameMap.get(base).push(path);
+    }
+    updateLogItem(el, (noteExtra?noteExtra+' · ':'') + (sha?'已覆盖更新':'已新建'), 'ok');
+  }catch(e){
+    updateLogItem(el, '失败：' + e.message, 'err');
+  }
+}
+
+function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer){
+  const id = 'a' + Math.random().toString(36).slice(2);
+  const el = document.createElement('div');
+  el.className = 'log-item pending';
+  el.id = 'log-' + id;
+  const btns = candidates.map((p,i)=>`<button data-i="${i}">${escapeHtml(p)}</button>`).join('');
+  el.innerHTML = `<div class="icon">❓</div>
+    <div class="body">
+      <div class="path mono">${escapeHtml(baseName)}</div>
+      <div class="note">仓库里有多个同名文件，点选要覆盖的一个：</div>
+      <div class="ambiguous">${btns}<button data-new="1">都不是，新建于根目录</button></div>
+    </div>`;
+  $('log').prepend(el);
+  el.querySelectorAll('button').forEach(btn=>{
+    btn.onclick = ()=>{
+      el.remove();
+      if(btn.dataset.new){
+        uploadOne(fallback, arrayBuffer, '新建');
+      }else{
+        uploadOne(candidates[btn.dataset.i], arrayBuffer, '手动选择');
+      }
+    };
+  });
+}
+
+async function handleFiles(fileList){
+  $('uploadStatus').textContent = '正在处理…';
+  const files = Array.from(fileList);
+  for(const file of files){
+    if(/\.zip$/i.test(file.name)){
+      try{
+        const buf = await file.arrayBuffer();
+        const zip = await JSZip.loadAsync(buf);
+        const entries = Object.values(zip.files).filter(e=>!e.dir);
+        for(const entry of entries){
+          const content = await entry.async('arraybuffer');
+          const baseName = entry.name.split('/').pop();
+          const target = resolveTarget(entry.name, baseName);
+          if(target.type === 'ambiguous'){
+            showAmbiguousChoice(baseName, target.candidates, target.fallback, content);
+          }else{
+            const note = target.type === 'exact' ? '压缩包内路径匹配' : target.type === 'byname' ? '按文件名匹配到仓库路径' : '仓库中无此文件，按压缩包路径新建';
+            await uploadOne(target.path, content, note);
+          }
+        }
+      }catch(e){
+        addLogItem('z'+Math.random(), file.name, '压缩包处理失败：' + e.message, 'err');
+      }
+    }else{
+      const content = await file.arrayBuffer();
+      const target = resolveTarget(null, file.name);
+      if(target.type === 'ambiguous'){
+        showAmbiguousChoice(file.name, target.candidates, target.fallback, content);
+      }else{
+        const note = target.type === 'byname' ? '按文件名匹配到仓库路径' : '仓库中未找到同名文件，已放到根目录';
+        await uploadOne(target.path, content, note);
+      }
+    }
+  }
+  $('uploadStatus').textContent = '处理完成';
+}
+
+$('fileInput').addEventListener('change', e=>{
+  if(e.target.files && e.target.files.length){
+    handleFiles(e.target.files);
+    e.target.value = '';
+  }
+});
+
+// 初始化
+(function init(){
+  if(loadSettings()){
+    fetchTree().then(()=>{
+      $('uploadCard').classList.remove('hidden');
+      $('logCard').classList.remove('hidden');
+      $('settingsCard').classList.add('hidden');
+      updateRepoTag();
+    }).catch(e=>{
+      showSettings();
+      $('settingsStatus').textContent = '自动连接失败：' + e.message;
+      $('settingsStatus').style.color = 'var(--danger)';
+    });
+  }else{
+    showSettings();
+  }
+})();
+</script>
+</body>
+</html>
