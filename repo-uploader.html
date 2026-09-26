@@ -199,21 +199,35 @@
   .log-item.err{border-color:color-mix(in srgb, var(--danger) 45%, var(--line));}
   .log-item.pending{opacity:.6;}
   .ambiguous{
-    display:flex;
-    flex-wrap:wrap;
-    gap:6px;
-    margin-top:8px;
+    margin-top:10px;
   }
-  .ambiguous button{
-    font-size:12px;
-    padding:6px 10px;
-    border-radius:7px;
-    border:1px solid var(--teal);
-    background:none;
-    color:var(--teal);
+  select.path-select, input.path-input{
+    width:100%;
+    padding:10px 11px;
+    border-radius:8px;
+    border:1px solid var(--line);
+    background:var(--card);
+    color:var(--ink);
+    font-size:13px;
+    margin-bottom:8px;
+  }
+  select.path-select:focus, input.path-input:focus{
+    outline:2px solid var(--teal);
+    outline-offset:1px;
+  }
+  button.confirm-btn{
+    width:100%;
+    background:var(--teal);
+    color:#fff;
+    border:none;
+    padding:9px;
+    border-radius:8px;
+    font-size:13px;
+    font-weight:600;
     cursor:pointer;
     font-family:inherit;
   }
+  button.confirm-btn:active{background:var(--teal-deep);}
   .hidden{display:none !important;}
   .empty-hint{
     font-size:13px;
@@ -483,29 +497,58 @@ async function uploadOne(path, arrayBuffer, noteExtra){
   }
 }
 
+function showNewFileConfirm(fileName, suggestedPath, arrayBuffer){
+  const id = 'n' + Math.random().toString(36).slice(2);
+  const el = document.createElement('div');
+  el.className = 'log-item pending';
+  el.id = 'log-' + id;
+  el.innerHTML = `<div class="icon">🆕</div>
+    <div class="body">
+      <div class="path mono">${escapeHtml(fileName)}</div>
+      <div class="note">仓库里没有同名文件。确认新建路径，要放进新文件夹就在前面加"文件夹名/"：</div>
+      <div class="ambiguous">
+        <input type="text" class="path-input mono" value="${escapeHtml(suggestedPath)}">
+        <button class="confirm-btn">确认上传</button>
+      </div>
+    </div>`;
+  $('log').prepend(el);
+  el.querySelector('.confirm-btn').onclick = ()=>{
+    const val = el.querySelector('.path-input').value.trim().replace(/^\/+/, '');
+    el.remove();
+    if(!val) return;
+    uploadOne(val, arrayBuffer, '新建');
+  };
+}
+
 function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer){
   const id = 'a' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
-  const btns = candidates.map((p,i)=>`<button data-i="${i}">${escapeHtml(p)}</button>`).join('');
+  const options = candidates.map((p,i)=>`<option value="${i}">${escapeHtml(p)}</option>`).join('');
   el.innerHTML = `<div class="icon">❓</div>
     <div class="body">
       <div class="path mono">${escapeHtml(baseName)}</div>
-      <div class="note">仓库里有多个同名文件，点选要覆盖的一个：</div>
-      <div class="ambiguous">${btns}<button data-new="1">都不是，新建于根目录</button></div>
+      <div class="note">仓库里有多个同名文件，选一个完整路径再确认：</div>
+      <div class="ambiguous">
+        <select class="path-select mono">
+          ${options}
+          <option value="new">＋ 都不是，新建于 ${escapeHtml(fallback)}</option>
+        </select>
+        <button class="confirm-btn">确认上传</button>
+      </div>
     </div>`;
   $('log').prepend(el);
-  el.querySelectorAll('button').forEach(btn=>{
-    btn.onclick = ()=>{
-      el.remove();
-      if(btn.dataset.new){
-        uploadOne(fallback, arrayBuffer, '新建');
-      }else{
-        uploadOne(candidates[btn.dataset.i], arrayBuffer, '手动选择');
-      }
-    };
-  });
+  el.querySelector('.confirm-btn').onclick = ()=>{
+    const sel = el.querySelector('.path-select');
+    const v = sel.value;
+    el.remove();
+    if(v === 'new'){
+      uploadOne(fallback, arrayBuffer, '新建');
+    }else{
+      uploadOne(candidates[parseInt(v,10)], arrayBuffer, '手动选择');
+    }
+  };
 }
 
 async function handleFiles(fileList){
@@ -536,9 +579,10 @@ async function handleFiles(fileList){
       const target = resolveTarget(null, file.name);
       if(target.type === 'ambiguous'){
         showAmbiguousChoice(file.name, target.candidates, target.fallback, content);
+      }else if(target.type === 'new'){
+        showNewFileConfirm(file.name, target.path, content);
       }else{
-        const note = target.type === 'byname' ? '按文件名匹配到仓库路径' : '仓库中未找到同名文件，已放到根目录';
-        await uploadOne(target.path, content, note);
+        await uploadOne(target.path, content, '按文件名匹配到仓库路径');
       }
     }
   }
