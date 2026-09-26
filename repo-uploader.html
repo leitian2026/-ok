@@ -228,6 +228,7 @@
     font-family:inherit;
   }
   button.confirm-btn:active{background:var(--teal-deep);}
+  button.confirm-btn:disabled{background:var(--line); color:var(--ink-soft); cursor:not-allowed;}
   .hidden{display:none !important;}
   .empty-hint{
     font-size:13px;
@@ -512,8 +513,10 @@ async function uploadOne(path, arrayBuffer, noteExtra){
       if(!state.basenameMap.get(base).includes(path)) state.basenameMap.get(base).push(path);
     }
     updateLogItem(el, (noteExtra?noteExtra+' · ':'') + (sha?'已覆盖更新':'已新建'), 'ok');
+    return true;
   }catch(e){
     updateLogItem(el, '失败：' + e.message, 'err');
+    return false;
   }
 }
 
@@ -582,25 +585,69 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer){
 //    也可以选择保留，原样对应仓库里的子文件夹。
 // 3) 上传前先显示完整的目标路径列表，人工确认无误后再一次性提交，
 //    不会出现"传完了才发现路径错了"的情况。
+// 4) 自动过滤系统垃圾文件（__MACOSX、.DS_Store、Thumbs.db、AppleDouble ._*）。
+// 5) 拦截压缩包内的路径穿越条目（包含 ".." 的路径），不允许上传。
+// 6) 对超过 1MB 的文件给出警告（GitHub Contents API 对单文件大小有限制，
+//    超过 1MB 大概率会返回错误），并默认不勾选常见的构建产物/依赖缓存目录
+//    （node_modules、build、.gradle、.idea、dist、out、target），
+//    避免手滑把整个构建缓存也传进仓库。
+// 7) 上传结束后给出批量结果汇总（成功/失败各多少个）。
+
+const JUNK_PATTERNS = [
+  /(^|\/)__MACOSX(\/|$)/,
+  /(^|\/)\.DS_Store$/,
+  /(^|\/)Thumbs\.db$/i,
+  /(^|\/)\._[^\/]+$/, // AppleDouble 资源叉文件
+];
+const HEAVY_DIR_PATTERN = /(^|\/)(node_modules|build|\.gradle|\.idea|dist|out|target)(\/|$)/i;
+const LARGE_FILE_THRESHOLD = 1000 * 1000; // ~1MB，GitHub Contents API 单文件上限附近
+
+function isJunkPath(p){
+  return JUNK_PATTERNS.some(re => re.test(p));
+}
+function hasPathTraversal(p){
+  return p.split('/').some(seg => seg === '..' || seg === '.') || p.startsWith('/');
+}
+function formatBytes(n){
+  if(n == null) return '';
+  if(n < 1024) return n + ' B';
+  if(n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/1024/1024).toFixed(2) + ' MB';
+}
+function entrySize(entry){
+  // JSZip 没有正式公开的 size 属性，退而求其次读内部字段，读不到就返回 null（不影响功能，只是不显示大小/不做大文件预警）
+  try{ return entry._data ? entry._data.uncompressedSize : null; }catch(e){ return null; }
+}
+
 async function handleZipFile(file){
-  let zip, entries;
+  let zip, rawEntries;
   try{
     const buf = await file.arrayBuffer();
     zip = await JSZip.loadAsync(buf);
-    entries = Object.values(zip.files).filter(e=>!e.dir);
+    rawEntries = Object.values(zip.files).filter(e=>!e.dir);
   }catch(e){
     addLogItem('z'+Math.random(), file.name, '压缩包处理失败：' + e.message, 'err');
     return;
   }
-  if(entries.length === 0){
+  if(rawEntries.length === 0){
     addLogItem('z'+Math.random(), file.name, '压缩包内没有文件', 'err');
     return;
   }
+
+  // 自动剔除系统垃圾文件，不进入后续任何流程
+  const junkCount = rawEntries.filter(e => isJunkPath(e.name)).length;
+  const entries = rawEntries.filter(e => !isJunkPath(e.name));
+
+  if(entries.length === 0){
+    addLogItem('z'+Math.random(), file.name, '压缩包内除系统垃圾文件外没有其他内容', 'err');
+    return;
+  }
+
   // 检测唯一的顶层外壳文件夹：所有条目的第一层目录名都相同，且都带这层目录
   const tops = new Set(entries.map(e=>e.name.split('/')[0]));
   const allNested = entries.every(e=>e.name.includes('/'));
   const singleTop = (tops.size === 1 && allNested) ? [...tops][0] : null;
-  renderZipPreview(file.name, entries, singleTop);
+  renderZipPreview(file.name, entries, singleTop, junkCount);
 }
 
 function computeZipTargets(entries, singleTop, strip){
@@ -609,19 +656,45 @@ function computeZipTargets(entries, singleTop, strip){
     if(strip && singleTop){
       p = p.slice(singleTop.length + 1);
     }
-    return { entry:e, path:p, exists: state.pathSet.has(p) };
+    const invalid = hasPathTraversal(p) || !p;
+    const size = entrySize(e);
+    const heavy = HEAVY_DIR_PATTERN.test(p);
+    const large = size != null && size > LARGE_FILE_THRESHOLD;
+    return {
+      entry:e,
+      path:p,
+      exists: !invalid && state.pathSet.has(p),
+      invalid,
+      size,
+      heavy,
+      large,
+      // 默认勾选：路径合法，且不是疑似构建产物/依赖缓存目录
+      defaultChecked: !invalid && !heavy
+    };
   });
 }
 
-function renderZipPreview(zipName, entries, singleTop){
+function renderZipPreview(zipName, entries, singleTop, junkCount){
   const id = 'zp' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
 
-  const renderList = (targets) => targets.map(t=>{
-    const tag = t.exists ? '📝 覆盖已存在文件' : '🆕 新建';
-    return `<div class="path mono" style="margin-top:4px;">${tag} — ${escapeHtml(t.path)}</div>`;
+  const renderList = (targets) => targets.map((t, idx)=>{
+    if(t.invalid){
+      return `<div class="path mono" style="margin-top:4px;color:var(--danger);">
+        ⛔ 路径不合法，已跳过（不会上传） — ${escapeHtml(t.path || '(空路径)')}
+      </div>`;
+    }
+    const tags = [];
+    tags.push(t.exists ? '📝覆盖' : '🆕新建');
+    if(t.heavy) tags.push('⚠️疑似构建产物/缓存目录');
+    if(t.large) tags.push(`⚠️${formatBytes(t.size)}，可能超出GitHub单文件上传限制`);
+    const sizeStr = t.size != null ? `<span style="opacity:.6;"> (${formatBytes(t.size)})</span>` : '';
+    return `<label style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;cursor:pointer;">
+      <input type="checkbox" class="target-check" data-idx="${idx}" ${t.defaultChecked ? 'checked' : ''} style="margin-top:3px;">
+      <span class="path mono">${tags.join(' ')} — ${escapeHtml(t.path)}${sizeStr}</span>
+    </label>`;
   }).join('');
 
   const stripCheckboxHtml = singleTop
@@ -631,14 +704,20 @@ function renderZipPreview(zipName, entries, singleTop){
        </label>`
     : '';
 
+  const junkNote = junkCount > 0
+    ? `<div class="note">已自动跳过 ${junkCount} 个系统垃圾文件（__MACOSX / .DS_Store / Thumbs.db 等）</div>`
+    : '';
+
   el.innerHTML = `<div class="icon">📦</div>
     <div class="body">
       <div class="path mono">${escapeHtml(zipName)}</div>
       <div class="note">压缩包内共 ${entries.length} 个文件，确认下面的目标路径无误后再上传：</div>
+      ${junkNote}
       ${stripCheckboxHtml}
+      <div class="note" style="margin-top:6px;">未勾选的行不会上传（默认取消勾选疑似构建产物/缓存目录、以及路径不合法的条目）：</div>
       <div class="zip-target-list"></div>
       <div class="ambiguous">
-        <button class="confirm-btn confirm-zip">确认上传全部 ${entries.length} 个文件</button>
+        <button class="confirm-btn confirm-zip">确认上传已勾选的文件</button>
         <button class="ghost cancel-zip" style="margin-top:8px;">取消</button>
       </div>
     </div>`;
@@ -646,26 +725,55 @@ function renderZipPreview(zipName, entries, singleTop){
 
   const listEl = el.querySelector('.zip-target-list');
   const checkbox = el.querySelector('.strip-top');
-  let currentTargets = computeZipTargets(entries, singleTop, checkbox ? checkbox.checked : false);
+  const confirmBtn = el.querySelector('.confirm-zip');
+  let currentTargets = [];
+  let checkedState = []; // 与 currentTargets 下标对应的 boolean 数组
+
+  function countChecked(){
+    return checkedState.filter(Boolean).length;
+  }
+  function updateConfirmLabel(){
+    confirmBtn.textContent = `确认上传已勾选的 ${countChecked()} 个文件`;
+    confirmBtn.disabled = countChecked() === 0;
+  }
 
   function refresh(){
     currentTargets = computeZipTargets(entries, singleTop, checkbox ? checkbox.checked : false);
+    checkedState = currentTargets.map(t => t.defaultChecked);
     listEl.innerHTML = renderList(currentTargets);
+    updateConfirmLabel();
   }
   refresh();
   if(checkbox) checkbox.addEventListener('change', refresh);
 
+  listEl.addEventListener('change', (ev)=>{
+    if(ev.target.classList.contains('target-check')){
+      const idx = parseInt(ev.target.dataset.idx, 10);
+      checkedState[idx] = ev.target.checked;
+      updateConfirmLabel();
+    }
+  });
+
   el.querySelector('.cancel-zip').onclick = () => el.remove();
 
-  el.querySelector('.confirm-zip').onclick = async () => {
+  confirmBtn.onclick = async () => {
+    const toUpload = currentTargets.filter((t, idx) => checkedState[idx] && !t.invalid);
     el.remove();
-    for(const t of currentTargets){
+    let okCount = 0, failCount = 0;
+    for(const t of toUpload){
       const content = await t.entry.async('arraybuffer');
       const note = t.exists ? '覆盖（压缩包结构确认）' : '新建（压缩包结构确认）';
-      await uploadOne(t.path, content, note);
+      const ok = await uploadOne(t.path, content, note);
+      if(ok) okCount++; else failCount++;
     }
+    const cls = failCount === 0 ? 'ok' : 'err';
+    const summary = failCount === 0
+      ? `批量上传完成：${okCount} 个全部成功`
+      : `批量上传完成：${okCount} 个成功，${failCount} 个失败（失败原因见上方对应记录）`;
+    addLogItem('sum'+Math.random(), zipName, summary, cls);
   };
 }
+
 
 async function handleFiles(fileList){
   $('uploadStatus').textContent = '正在处理…';
