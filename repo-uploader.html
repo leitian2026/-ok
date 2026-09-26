@@ -240,6 +240,15 @@
     color:var(--ink-soft);
     margin:0 0 10px;
   }
+  .zip-target-list{
+    max-height:220px;
+    overflow-y:auto;
+    border:1px solid var(--line);
+    border-radius:8px;
+    padding:8px 10px;
+    margin:6px 0;
+    background:var(--paper);
+  }
 </style>
 </head>
 <body>
@@ -562,29 +571,108 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer){
   };
 }
 
+// ---- 压缩包处理：先解析结构，展示预览，用户确认后才真正上传 ----
+// 核心修复点：
+// 1) 压缩包内每个文件的目标路径，完全按"压缩包内部的相对路径"决定，
+//    不再用"文件名"去仓库全树里反查同名文件——避免不同目录下的同名文件
+//    （比如根目录 build.gradle 和 app/build.gradle）互相认成同一个目标、
+//    彼此覆盖。
+// 2) 自动识别压缩包是否包多出一层外壳文件夹（比如解压后所有文件都在
+//    "项目名/"下面），可以选择去掉这层，让内容直接摊平到仓库根目录，
+//    也可以选择保留，原样对应仓库里的子文件夹。
+// 3) 上传前先显示完整的目标路径列表，人工确认无误后再一次性提交，
+//    不会出现"传完了才发现路径错了"的情况。
+async function handleZipFile(file){
+  let zip, entries;
+  try{
+    const buf = await file.arrayBuffer();
+    zip = await JSZip.loadAsync(buf);
+    entries = Object.values(zip.files).filter(e=>!e.dir);
+  }catch(e){
+    addLogItem('z'+Math.random(), file.name, '压缩包处理失败：' + e.message, 'err');
+    return;
+  }
+  if(entries.length === 0){
+    addLogItem('z'+Math.random(), file.name, '压缩包内没有文件', 'err');
+    return;
+  }
+  // 检测唯一的顶层外壳文件夹：所有条目的第一层目录名都相同，且都带这层目录
+  const tops = new Set(entries.map(e=>e.name.split('/')[0]));
+  const allNested = entries.every(e=>e.name.includes('/'));
+  const singleTop = (tops.size === 1 && allNested) ? [...tops][0] : null;
+  renderZipPreview(file.name, entries, singleTop);
+}
+
+function computeZipTargets(entries, singleTop, strip){
+  return entries.map(e=>{
+    let p = e.name;
+    if(strip && singleTop){
+      p = p.slice(singleTop.length + 1);
+    }
+    return { entry:e, path:p, exists: state.pathSet.has(p) };
+  });
+}
+
+function renderZipPreview(zipName, entries, singleTop){
+  const id = 'zp' + Math.random().toString(36).slice(2);
+  const el = document.createElement('div');
+  el.className = 'log-item pending';
+  el.id = 'log-' + id;
+
+  const renderList = (targets) => targets.map(t=>{
+    const tag = t.exists ? '📝 覆盖已存在文件' : '🆕 新建';
+    return `<div class="path mono" style="margin-top:4px;">${tag} — ${escapeHtml(t.path)}</div>`;
+  }).join('');
+
+  const stripCheckboxHtml = singleTop
+    ? `<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-soft);margin:8px 0;">
+         <input type="checkbox" class="strip-top" checked>
+         检测到压缩包顶层文件夹「${escapeHtml(singleTop)}/」，去掉这层，内容直接放到目标目录下
+       </label>`
+    : '';
+
+  el.innerHTML = `<div class="icon">📦</div>
+    <div class="body">
+      <div class="path mono">${escapeHtml(zipName)}</div>
+      <div class="note">压缩包内共 ${entries.length} 个文件，确认下面的目标路径无误后再上传：</div>
+      ${stripCheckboxHtml}
+      <div class="zip-target-list"></div>
+      <div class="ambiguous">
+        <button class="confirm-btn confirm-zip">确认上传全部 ${entries.length} 个文件</button>
+        <button class="ghost cancel-zip" style="margin-top:8px;">取消</button>
+      </div>
+    </div>`;
+  $('log').prepend(el);
+
+  const listEl = el.querySelector('.zip-target-list');
+  const checkbox = el.querySelector('.strip-top');
+  let currentTargets = computeZipTargets(entries, singleTop, checkbox ? checkbox.checked : false);
+
+  function refresh(){
+    currentTargets = computeZipTargets(entries, singleTop, checkbox ? checkbox.checked : false);
+    listEl.innerHTML = renderList(currentTargets);
+  }
+  refresh();
+  if(checkbox) checkbox.addEventListener('change', refresh);
+
+  el.querySelector('.cancel-zip').onclick = () => el.remove();
+
+  el.querySelector('.confirm-zip').onclick = async () => {
+    el.remove();
+    for(const t of currentTargets){
+      const content = await t.entry.async('arraybuffer');
+      const note = t.exists ? '覆盖（压缩包结构确认）' : '新建（压缩包结构确认）';
+      await uploadOne(t.path, content, note);
+    }
+  };
+}
+
 async function handleFiles(fileList){
   $('uploadStatus').textContent = '正在处理…';
   const files = Array.from(fileList);
   for(const file of files){
     if(/\.zip$/i.test(file.name)){
-      try{
-        const buf = await file.arrayBuffer();
-        const zip = await JSZip.loadAsync(buf);
-        const entries = Object.values(zip.files).filter(e=>!e.dir);
-        for(const entry of entries){
-          const content = await entry.async('arraybuffer');
-          const baseName = entry.name.split('/').pop();
-          const target = resolveTarget(entry.name, baseName);
-          if(target.type === 'ambiguous'){
-            showAmbiguousChoice(baseName, target.candidates, target.fallback, content);
-          }else{
-            const note = target.type === 'exact' ? '压缩包内路径匹配' : target.type === 'byname' ? '按文件名匹配到仓库路径' : '仓库中无此文件，按压缩包路径新建';
-            await uploadOne(target.path, content, note);
-          }
-        }
-      }catch(e){
-        addLogItem('z'+Math.random(), file.name, '压缩包处理失败：' + e.message, 'err');
-      }
+      await handleZipFile(file);
     }else{
       const content = await file.arrayBuffer();
       const target = resolveTarget(null, file.name);
