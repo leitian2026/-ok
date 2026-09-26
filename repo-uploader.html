@@ -393,16 +393,27 @@ async function ghFetch(url, options={}){
   if(!res.ok){
     let msg = res.status + ' ' + res.statusText;
     try{ const j = await res.json(); if(j.message) msg = j.message; }catch(e){}
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
 
 async function fetchTree(){
-  const data = await ghFetch(`https://api.github.com/repos/${state.owner}/${state.repo}/git/trees/${encodeURIComponent(state.branch)}?recursive=1`);
   state.pathSet = new Set();
   state.pathShaMap = new Map();
   state.basenameMap = new Map();
+  let data;
+  try{
+    data = await ghFetch(`https://api.github.com/repos/${state.owner}/${state.repo}/git/trees/${encodeURIComponent(state.branch)}?recursive=1`);
+  }catch(e){
+    if(e.status === 409 && /empty/i.test(e.message)){
+      // 全新仓库，一个提交都没有：当作零文件处理，不算连接失败
+      return;
+    }
+    throw e;
+  }
   (data.tree||[]).forEach(item=>{
     if(item.type !== 'blob') return;
     state.pathSet.add(item.path);
