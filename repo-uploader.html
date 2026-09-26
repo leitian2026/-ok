@@ -278,9 +278,11 @@
   <div class="card hidden" id="uploadCard">
     <div class="drop" id="dropZone" onclick="document.getElementById('fileInput').click()">
       <div class="big">选择文件上传</div>
-      <div class="small">支持任意文件、任意数量，压缩包会自动展开</div>
+      <div class="small">支持任意文件、任意数量，压缩包会自动展开；也可以直接拖进来（支持同时拖多个文件夹），或用下方按钮选整个文件夹</div>
     </div>
     <input type="file" id="fileInput" multiple>
+    <button class="ghost" onclick="document.getElementById('folderInput').click()">选择整个文件夹上传（保留目录结构）</button>
+    <input type="file" id="folderInput" webkitdirectory directory multiple>
     <div class="status-line" id="uploadStatus"></div>
     <button class="ghost" onclick="refreshTree()">重新读取仓库结构</button>
   </div>
@@ -299,7 +301,15 @@ let state = {
   pathSet:new Set(),          // 仓库里已存在的完整路径
   pathShaMap:new Map(),       // path -> sha
   basenameMap:new Map(),      // 文件名(不含目录) -> [完整路径,...]
+  activeUploads:0,            // 正在进行中的上传请求数（用于刷新前警告）
 };
+
+function getLastDir(){
+  try{ return localStorage.getItem('repoUploaderLastDir') || ''; }catch(e){ return ''; }
+}
+function setLastDir(dir){
+  try{ if(dir) localStorage.setItem('repoUploaderLastDir', dir); }catch(e){}
+}
 
 function loadSettings(){
   try{
@@ -392,14 +402,28 @@ function updateRepoTag(){
 }
 
 async function ghFetch(url, options={}){
-  const res = await fetch(url, {
-    ...options,
-    headers:{
-      'Authorization': `token ${state.token}`,
-      'Accept':'application/vnd.github+json',
-      ...(options.headers||{})
+  // 20秒超时保护：网络卡住/断网时不会无限转圈，会明确报错而不是假死
+  const controller = new AbortController();
+  const timeoutId = setTimeout(()=>controller.abort(), 20000);
+  let res;
+  try{
+    res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers:{
+        'Authorization': `token ${state.token}`,
+        'Accept':'application/vnd.github+json',
+        ...(options.headers||{})
+      }
+    });
+  }catch(e){
+    if(e.name === 'AbortError'){
+      throw new Error('网络请求超时（20秒无响应，可能是断网了），请检查网络后重试');
     }
-  });
+    throw new Error('网络请求失败（可能是断网了）：' + e.message);
+  }finally{
+    clearTimeout(timeoutId);
+  }
   if(!res.ok){
     let msg = res.status + ' ' + res.statusText;
     try{ const j = await res.json(); if(j.message) msg = j.message; }catch(e){}
@@ -408,6 +432,19 @@ async function ghFetch(url, options={}){
     throw err;
   }
   return res.json();
+}
+
+// 计算内容对应的 git blob sha1（和 GitHub 返回的 blob sha 是同一种算法），
+// 用来判断"要上传的内容"和"仓库里已有的内容"是否完全一样。
+// 用途：断网/刷新页面后重新选中同一批文件重试时，内容没变的文件会
+// 自动跳过，不会重复占用一次 API 调用，也不会因为重复提交而困惑。
+async function gitBlobSha1(arrayBuffer){
+  const header = new TextEncoder().encode(`blob ${arrayBuffer.byteLength}\0`);
+  const combined = new Uint8Array(header.byteLength + arrayBuffer.byteLength);
+  combined.set(header, 0);
+  combined.set(new Uint8Array(arrayBuffer), header.byteLength);
+  const hashBuf = await crypto.subtle.digest('SHA-1', combined);
+  return Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 
 async function fetchTree(){
@@ -454,7 +491,12 @@ function resolveTarget(literalRelPath, baseName){
     return {type:'byname', path: matches[0]};
   }
   if(matches.length === 0){
-    return {type:'new', path: literalRelPath || baseName};
+    // 全新文件：不再默认扔到仓库根目录——如果之前上传过新文件，
+    // 优先建议用同一个目录，减少每次都要手动补目录前缀的麻烦
+    // （仍然是可编辑的建议值，不会未经确认就真的传到那里）。
+    const lastDir = getLastDir();
+    const suggested = literalRelPath || (lastDir ? `${lastDir}/${baseName}` : baseName);
+    return {type:'new', path: suggested};
   }
   return {type:'ambiguous', candidates: matches, fallback: literalRelPath || baseName};
 }
@@ -492,8 +534,21 @@ function escapeHtml(s){
 async function uploadOne(path, arrayBuffer, noteExtra){
   const id = 'u' + Math.random().toString(36).slice(2);
   const el = addLogItem(id, path, noteExtra ? noteExtra + ' · 上传中…' : '上传中…', 'pending');
+  state.activeUploads++;
   try{
     const sha = state.pathShaMap.get(path);
+    if(sha){
+      // 目标路径已有文件：先比对内容是否完全一样，一样就跳过，不重复提交
+      try{
+        const localSha = await gitBlobSha1(arrayBuffer);
+        if(localSha === sha){
+          updateLogItem(el, (noteExtra?noteExtra+' · ':'') + '内容和仓库里的完全一样，已跳过', 'ok');
+          return true;
+        }
+      }catch(hashErr){
+        // 哈希算不出来（极少见）就不影响主流程，继续正常上传
+      }
+    }
     const body = {
       message: `上传 ${path}（手机直传工具）`,
       content: arrayBufferToBase64(arrayBuffer),
@@ -517,42 +572,63 @@ async function uploadOne(path, arrayBuffer, noteExtra){
   }catch(e){
     updateLogItem(el, '失败：' + e.message, 'err');
     return false;
+  }finally{
+    state.activeUploads--;
   }
 }
 
-function showNewFileConfirm(fileName, suggestedPath, arrayBuffer){
+function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
   const id = 'n' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
+  const warnNote = (fileSize != null && fileSize > LARGE_FILE_THRESHOLD)
+    ? `<div class="note" style="color:var(--amber);">⚠️ ${formatBytes(fileSize)}，可能超出 GitHub 单文件上传限制（约1MB）</div>`
+    : '';
   el.innerHTML = `<div class="icon">🆕</div>
     <div class="body">
       <div class="path mono">${escapeHtml(fileName)}</div>
       <div class="note">仓库里没有同名文件。确认新建路径，要放进新文件夹就在前面加"文件夹名/"：</div>
+      ${warnNote}
       <div class="ambiguous">
         <input type="text" class="path-input mono" value="${escapeHtml(suggestedPath)}">
+        <div class="note path-error" style="color:var(--danger);display:none;"></div>
         <button class="confirm-btn">确认上传</button>
       </div>
     </div>`;
   $('log').prepend(el);
+  const errEl = el.querySelector('.path-error');
   el.querySelector('.confirm-btn').onclick = ()=>{
     const val = el.querySelector('.path-input').value.trim().replace(/^\/+/, '');
-    el.remove();
     if(!val) return;
+    if(hasPathTraversal(val)){
+      errEl.textContent = '路径不合法（不能包含 ".." 或以 "/" 开头），改一下再确认';
+      errEl.style.display = 'block';
+      return;
+    }
+    setLastDir(val.includes('/') ? val.slice(0, val.lastIndexOf('/')) : '');
+    el.remove();
     uploadOne(val, arrayBuffer, '新建');
   };
 }
 
-function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer){
+function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSize){
   const id = 'a' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
   const options = candidates.map((p,i)=>`<option value="${i}">${escapeHtml(p)}</option>`).join('');
+  const warnNote = (fileSize != null && fileSize > LARGE_FILE_THRESHOLD)
+    ? `<div class="note" style="color:var(--amber);">⚠️ ${formatBytes(fileSize)}，可能超出 GitHub 单文件上传限制（约1MB）</div>`
+    : '';
+  const matchNote = candidates.length > 1
+    ? '仓库里有多个同名文件，选一个完整路径再确认：'
+    : `仓库里已有同名文件（${escapeHtml(candidates[0])}），确认是覆盖它，还是新建一个不相干的文件：`;
   el.innerHTML = `<div class="icon">❓</div>
     <div class="body">
       <div class="path mono">${escapeHtml(baseName)}</div>
-      <div class="note">仓库里有多个同名文件，选一个完整路径再确认：</div>
+      <div class="note">${matchNote}</div>
+      ${warnNote}
       <div class="ambiguous">
         <select class="path-select mono">
           ${options}
@@ -574,24 +650,30 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer){
   };
 }
 
-// ---- 压缩包处理：先解析结构，展示预览，用户确认后才真正上传 ----
+// ---- 批量处理（压缩包 / 整个文件夹通用）：先解析结构，展示预览，用户确认后才真正上传 ----
 // 核心修复点：
-// 1) 压缩包内每个文件的目标路径，完全按"压缩包内部的相对路径"决定，
+// 1) 每个文件的目标路径，完全按"压缩包/文件夹内部的相对路径"决定，
 //    不再用"文件名"去仓库全树里反查同名文件——避免不同目录下的同名文件
 //    （比如根目录 build.gradle 和 app/build.gradle）互相认成同一个目标、
 //    彼此覆盖。
-// 2) 自动识别压缩包是否包多出一层外壳文件夹（比如解压后所有文件都在
-//    "项目名/"下面），可以选择去掉这层，让内容直接摊平到仓库根目录，
-//    也可以选择保留，原样对应仓库里的子文件夹。
+// 2) 自动识别是否包多出一层外壳文件夹（比如所有文件都在
+//    "项目名/"下面，或者就是你选中的那个文件夹本身），可以选择去掉这层，
+//    让内容直接摊平到仓库根目录，也可以选择保留，原样对应仓库里的子文件夹。
 // 3) 上传前先显示完整的目标路径列表，人工确认无误后再一次性提交，
 //    不会出现"传完了才发现路径错了"的情况。
-// 4) 自动过滤系统垃圾文件（__MACOSX、.DS_Store、Thumbs.db、AppleDouble ._*）。
-// 5) 拦截压缩包内的路径穿越条目（包含 ".." 的路径），不允许上传。
+// 4) 自动过滤系统垃圾文件（__MACOSX、.DS_Store、Thumbs.db、AppleDouble ._*）——
+//    压缩包和文件夹（尤其是 Mac 上选的文件夹）都常见这类文件。
+// 5) 拦截路径穿越条目（包含 ".." 或以 "/" 开头的路径），不允许上传。
 // 6) 对超过 1MB 的文件给出警告（GitHub Contents API 对单文件大小有限制，
 //    超过 1MB 大概率会返回错误），并默认不勾选常见的构建产物/依赖缓存目录
 //    （node_modules、build、.gradle、.idea、dist、out、target），
 //    避免手滑把整个构建缓存也传进仓库。
 // 7) 上传结束后给出批量结果汇总（成功/失败各多少个）。
+// 8) 压缩包（handleZipFile）和整个文件夹（handleFolderFiles）走同一套
+//    预览/确认/上传逻辑（prepareBatch / renderBatchPreview），行为完全一致。
+//    单个/多个零散文件（不经过文件夹或压缩包选择）走 handleFiles 里原有的
+//    "按文件名智能匹配"流程，但也补上了系统垃圾文件过滤、大文件警告、
+//    手填路径的穿越校验，以及处理完成后的批量汇总。
 
 const JUNK_PATTERNS = [
   /(^|\/)__MACOSX(\/|$)/,
@@ -619,6 +701,26 @@ function entrySize(entry){
   try{ return entry._data ? entry._data.uncompressedSize : null; }catch(e){ return null; }
 }
 
+// 检测唯一的顶层外壳文件夹：所有条目的第一层目录名都相同，且都带这层目录
+function detectSingleTop(items){
+  const tops = new Set(items.map(i=>i.name.split('/')[0]));
+  const allNested = items.every(i=>i.name.includes('/'));
+  return (tops.size === 1 && allNested) ? [...tops][0] : null;
+}
+
+// items: [{name, size, getData:()=>Promise<ArrayBuffer>}]
+function prepareBatch(batchName, rawItems, icon, sourceLabel){
+  const junkCount = rawItems.filter(i => isJunkPath(i.name)).length;
+  const items = rawItems.filter(i => !isJunkPath(i.name));
+  if(items.length === 0){
+    const msg = junkCount > 0 ? `${sourceLabel}内除系统垃圾文件外没有其他内容` : `${sourceLabel}内没有文件`;
+    addLogItem('b'+Math.random(), batchName, msg, 'err');
+    return;
+  }
+  const singleTop = detectSingleTop(items);
+  renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel);
+}
+
 async function handleZipFile(file){
   let zip, rawEntries;
   try{
@@ -633,35 +735,105 @@ async function handleZipFile(file){
     addLogItem('z'+Math.random(), file.name, '压缩包内没有文件', 'err');
     return;
   }
-
-  // 自动剔除系统垃圾文件，不进入后续任何流程
-  const junkCount = rawEntries.filter(e => isJunkPath(e.name)).length;
-  const entries = rawEntries.filter(e => !isJunkPath(e.name));
-
-  if(entries.length === 0){
-    addLogItem('z'+Math.random(), file.name, '压缩包内除系统垃圾文件外没有其他内容', 'err');
-    return;
-  }
-
-  // 检测唯一的顶层外壳文件夹：所有条目的第一层目录名都相同，且都带这层目录
-  const tops = new Set(entries.map(e=>e.name.split('/')[0]));
-  const allNested = entries.every(e=>e.name.includes('/'));
-  const singleTop = (tops.size === 1 && allNested) ? [...tops][0] : null;
-  renderZipPreview(file.name, entries, singleTop, junkCount);
+  const items = rawEntries.map(e => ({
+    name: e.name,
+    size: entrySize(e),
+    getData: () => e.async('arraybuffer')
+  }));
+  prepareBatch(file.name, items, '📦', '压缩包');
 }
 
-function computeZipTargets(entries, singleTop, strip){
-  return entries.map(e=>{
-    let p = e.name;
+async function handleFolderFiles(fileList){
+  const files = Array.from(fileList).filter(f => f.webkitRelativePath);
+  if(files.length === 0){
+    addLogItem('f'+Math.random(), '文件夹', '没有读取到文件夹内容', 'err');
+    return;
+  }
+  const folderLabel = files[0].webkitRelativePath.split('/')[0] || '文件夹';
+  const items = files.map(f => ({
+    name: f.webkitRelativePath,
+    size: f.size,
+    getData: () => f.arrayBuffer()
+  }));
+  prepareBatch(folderLabel, items, '📁', '文件夹');
+}
+
+// ---- 拖放支持：可以一次拖进多个文件夹 + 多个零散文件混在一起 ----
+// 原生的"选择文件夹"输入框一次只能选一个文件夹（这是操作系统选择器的限制，
+// 不是本工具的限制）。要一次处理多个文件夹，用拖放：桌面浏览器的拖放支持
+// 一次性读取多个文件夹和文件的完整目录结构。
+function readEntryAsFile(entry){
+  return new Promise((resolve, reject)=> entry.file(resolve, reject));
+}
+function readAllDirEntries(dirReader){
+  return new Promise((resolve, reject)=>{
+    let all = [];
+    (function readBatch(){
+      dirReader.readEntries(batch=>{
+        if(!batch.length){ resolve(all); return; }
+        all = all.concat(batch);
+        readBatch();
+      }, reject);
+    })();
+  });
+}
+async function collectEntryFiles(entry, out){
+  if(entry.isFile){
+    const file = await readEntryAsFile(entry);
+    out.push({
+      name: entry.fullPath.replace(/^\//, ''),
+      size: file.size,
+      getData: () => file.arrayBuffer()
+    });
+  }else if(entry.isDirectory){
+    const entries = await readAllDirEntries(entry.createReader());
+    for(const child of entries){
+      await collectEntryFiles(child, out);
+    }
+  }
+}
+async function handleDataTransfer(dataTransfer){
+  if(!dataTransfer) return;
+  const items = Array.from(dataTransfer.items || []);
+  const canUseEntries = items.length && typeof items[0].webkitGetAsEntry === 'function';
+  if(!canUseEntries){
+    // 不支持目录读取的环境（比如部分移动浏览器）：退化为普通文件列表
+    if(dataTransfer.files && dataTransfer.files.length) await handleFiles(dataTransfer.files);
+    return;
+  }
+  const entries = items.map(it => it.webkitGetAsEntry()).filter(Boolean);
+  if(entries.length === 0) return;
+  const anyDir = entries.some(e => e.isDirectory);
+  if(!anyDir){
+    // 全是零散文件，没有文件夹：走原来的按文件名智能匹配流程
+    if(dataTransfer.files && dataTransfer.files.length) await handleFiles(dataTransfer.files);
+    return;
+  }
+  // 含至少一个文件夹：统一走批量预览流程，支持同时拖进多个文件夹/文件
+  const out = [];
+  for(const entry of entries){
+    await collectEntryFiles(entry, out);
+  }
+  if(out.length === 0){
+    addLogItem('d'+Math.random(), '拖放内容', '没有读取到文件', 'err');
+    return;
+  }
+  const label = entries.length === 1 ? (entries[0].name || '文件夹') : `拖放的 ${entries.length} 项`;
+  prepareBatch(label, out, '📁', '拖放内容');
+}
+
+function computeBatchTargets(items, singleTop, strip){
+  return items.map(item=>{
+    let p = item.name;
     if(strip && singleTop){
       p = p.slice(singleTop.length + 1);
     }
     const invalid = hasPathTraversal(p) || !p;
-    const size = entrySize(e);
+    const size = item.size;
     const heavy = HEAVY_DIR_PATTERN.test(p);
     const large = size != null && size > LARGE_FILE_THRESHOLD;
     return {
-      entry:e,
+      item,
       path:p,
       exists: !invalid && state.pathSet.has(p),
       invalid,
@@ -674,8 +846,8 @@ function computeZipTargets(entries, singleTop, strip){
   });
 }
 
-function renderZipPreview(zipName, entries, singleTop, junkCount){
-  const id = 'zp' + Math.random().toString(36).slice(2);
+function renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel){
+  const id = 'bp' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
@@ -700,7 +872,7 @@ function renderZipPreview(zipName, entries, singleTop, junkCount){
   const stripCheckboxHtml = singleTop
     ? `<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-soft);margin:8px 0;">
          <input type="checkbox" class="strip-top" checked>
-         检测到压缩包顶层文件夹「${escapeHtml(singleTop)}/」，去掉这层，内容直接放到目标目录下
+         检测到最外层文件夹「${escapeHtml(singleTop)}/」，去掉这层，内容直接放到目标目录下
        </label>`
     : '';
 
@@ -708,24 +880,24 @@ function renderZipPreview(zipName, entries, singleTop, junkCount){
     ? `<div class="note">已自动跳过 ${junkCount} 个系统垃圾文件（__MACOSX / .DS_Store / Thumbs.db 等）</div>`
     : '';
 
-  el.innerHTML = `<div class="icon">📦</div>
+  el.innerHTML = `<div class="icon">${icon}</div>
     <div class="body">
-      <div class="path mono">${escapeHtml(zipName)}</div>
-      <div class="note">压缩包内共 ${entries.length} 个文件，确认下面的目标路径无误后再上传：</div>
+      <div class="path mono">${escapeHtml(batchName)}</div>
+      <div class="note">${sourceLabel}内共 ${items.length} 个文件，确认下面的目标路径无误后再上传：</div>
       ${junkNote}
       ${stripCheckboxHtml}
       <div class="note" style="margin-top:6px;">未勾选的行不会上传（默认取消勾选疑似构建产物/缓存目录、以及路径不合法的条目）：</div>
       <div class="zip-target-list"></div>
       <div class="ambiguous">
-        <button class="confirm-btn confirm-zip">确认上传已勾选的文件</button>
-        <button class="ghost cancel-zip" style="margin-top:8px;">取消</button>
+        <button class="confirm-btn confirm-batch">确认上传已勾选的文件</button>
+        <button class="ghost cancel-batch" style="margin-top:8px;">取消</button>
       </div>
     </div>`;
   $('log').prepend(el);
 
   const listEl = el.querySelector('.zip-target-list');
   const checkbox = el.querySelector('.strip-top');
-  const confirmBtn = el.querySelector('.confirm-zip');
+  const confirmBtn = el.querySelector('.confirm-batch');
   let currentTargets = [];
   let checkedState = []; // 与 currentTargets 下标对应的 boolean 数组
 
@@ -738,7 +910,7 @@ function renderZipPreview(zipName, entries, singleTop, junkCount){
   }
 
   function refresh(){
-    currentTargets = computeZipTargets(entries, singleTop, checkbox ? checkbox.checked : false);
+    currentTargets = computeBatchTargets(items, singleTop, checkbox ? checkbox.checked : false);
     checkedState = currentTargets.map(t => t.defaultChecked);
     listEl.innerHTML = renderList(currentTargets);
     updateConfirmLabel();
@@ -754,15 +926,15 @@ function renderZipPreview(zipName, entries, singleTop, junkCount){
     }
   });
 
-  el.querySelector('.cancel-zip').onclick = () => el.remove();
+  el.querySelector('.cancel-batch').onclick = () => el.remove();
 
   confirmBtn.onclick = async () => {
     const toUpload = currentTargets.filter((t, idx) => checkedState[idx] && !t.invalid);
     el.remove();
     let okCount = 0, failCount = 0;
     for(const t of toUpload){
-      const content = await t.entry.async('arraybuffer');
-      const note = t.exists ? '覆盖（压缩包结构确认）' : '新建（压缩包结构确认）';
+      const content = await t.item.getData();
+      const note = t.exists ? `覆盖（${sourceLabel}结构确认）` : `新建（${sourceLabel}结构确认）`;
       const ok = await uploadOne(t.path, content, note);
       if(ok) okCount++; else failCount++;
     }
@@ -770,7 +942,7 @@ function renderZipPreview(zipName, entries, singleTop, junkCount){
     const summary = failCount === 0
       ? `批量上传完成：${okCount} 个全部成功`
       : `批量上传完成：${okCount} 个成功，${failCount} 个失败（失败原因见上方对应记录）`;
-    addLogItem('sum'+Math.random(), zipName, summary, cls);
+    addLogItem('sum'+Math.random(), batchName, summary, cls);
   };
 }
 
@@ -778,28 +950,82 @@ function renderZipPreview(zipName, entries, singleTop, junkCount){
 async function handleFiles(fileList){
   $('uploadStatus').textContent = '正在处理…';
   const files = Array.from(fileList);
+  let skippedJunk = 0, autoOk = 0, autoFail = 0, pending = 0;
   for(const file of files){
     if(/\.zip$/i.test(file.name)){
       await handleZipFile(file);
+      continue;
+    }
+    if(isJunkPath(file.name)){
+      skippedJunk++;
+      continue;
+    }
+    const content = await file.arrayBuffer();
+    const target = resolveTarget(null, file.name);
+    if(target.type === 'ambiguous'){
+      pending++;
+      showAmbiguousChoice(file.name, target.candidates, target.fallback, content, file.size);
+    }else if(target.type === 'byname'){
+      // 仓库里恰好有一个同名文件：不再直接静默覆盖，必须用户确认
+      pending++;
+      showAmbiguousChoice(file.name, [target.path], file.name, content, file.size);
+    }else if(target.type === 'new'){
+      pending++;
+      showNewFileConfirm(file.name, target.path, content, file.size);
     }else{
-      const content = await file.arrayBuffer();
-      const target = resolveTarget(null, file.name);
-      if(target.type === 'ambiguous'){
-        showAmbiguousChoice(file.name, target.candidates, target.fallback, content);
-      }else if(target.type === 'new'){
-        showNewFileConfirm(file.name, target.path, content);
-      }else{
-        await uploadOne(target.path, content, '按文件名匹配到仓库路径');
-      }
+      const sizeNote = file.size > LARGE_FILE_THRESHOLD ? `（⚠️${formatBytes(file.size)}，注意GitHub单文件上传限制）` : '';
+      const ok = await uploadOne(target.path, content, '按文件名匹配到仓库路径' + sizeNote);
+      if(ok) autoOk++; else autoFail++;
     }
   }
-  $('uploadStatus').textContent = '处理完成';
+  const parts = [];
+  if(autoOk) parts.push(`${autoOk} 个已上传`);
+  if(autoFail) parts.push(`${autoFail} 个失败`);
+  if(pending) parts.push(`${pending} 个待你确认路径`);
+  if(skippedJunk) parts.push(`${skippedJunk} 个系统垃圾文件已跳过`);
+  $('uploadStatus').textContent = parts.length ? '处理完成：' + parts.join('，') : '处理完成';
 }
 
 $('fileInput').addEventListener('change', e=>{
   if(e.target.files && e.target.files.length){
     handleFiles(e.target.files);
     e.target.value = '';
+  }
+});
+
+$('folderInput').addEventListener('change', e=>{
+  if(e.target.files && e.target.files.length){
+    const hasRelPath = Array.from(e.target.files).some(f => f.webkitRelativePath);
+    if(hasRelPath){
+      handleFolderFiles(e.target.files);
+    }else{
+      // 设备不支持文件夹目录结构（比如部分移动端浏览器），退化为按单个文件处理
+      handleFiles(e.target.files);
+    }
+    e.target.value = '';
+  }
+});
+
+// 拖放：桌面浏览器下可以一次拖进多个文件夹和文件的混合内容
+const dropZoneEl = $('dropZone');
+['dragenter','dragover'].forEach(evt=>{
+  dropZoneEl.addEventListener(evt, e=>{ e.preventDefault(); dropZoneEl.classList.add('hover'); });
+});
+['dragleave','dragend'].forEach(evt=>{
+  dropZoneEl.addEventListener(evt, e=>{ dropZoneEl.classList.remove('hover'); });
+});
+dropZoneEl.addEventListener('drop', e=>{
+  e.preventDefault();
+  dropZoneEl.classList.remove('hover');
+  handleDataTransfer(e.dataTransfer);
+});
+
+// 意外刷新/关闭页面保护：有上传正在进行、或者有待确认的卡片还没处理时提示一下
+window.addEventListener('beforeunload', (e)=>{
+  const busy = state.activeUploads > 0 || !!document.querySelector('#log .log-item.pending');
+  if(busy){
+    e.preventDefault();
+    e.returnValue = '';
   }
 });
 
