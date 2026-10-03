@@ -787,7 +787,23 @@ function detectSingleTop(items){
 }
 
 // items: [{name, size, getData:()=>Promise<ArrayBuffer>}]
-function prepareBatch(batchName, rawItems, icon, sourceLabel){
+// 把"压缩包/文件夹里的文件"和"仓库里同路径的文件"按 git blob sha 比对，
+// 内容完全一样的标为"无变化"，预览里默认不勾选，不会重复上传。
+async function hashExistingItems(items, singleTop){
+  const need = items.filter(i=>{
+    if(HEAVY_DIR_PATTERN.test(i.name)) return false;
+    if(state.pathSet.has(i.name)) return true;
+    return !!singleTop && state.pathSet.has(i.name.slice(singleTop.length + 1));
+  });
+  if(!need.length) return;
+  const el = addLogItem('h'+Math.random(), '正在比对', `正在和仓库里已有的 ${need.length} 个同路径文件比对内容…`, 'pending');
+  for(const i of need){
+    try{ i.sha = await gitBlobSha1(await i.getData()); }catch(e){ i.sha = null; }
+  }
+  el.remove();
+}
+
+async function prepareBatch(batchName, rawItems, icon, sourceLabel){
   const junkCount = rawItems.filter(i => isJunkPath(i.name)).length;
   const items = rawItems.filter(i => !isJunkPath(i.name));
   if(items.length === 0){
@@ -796,6 +812,7 @@ function prepareBatch(batchName, rawItems, icon, sourceLabel){
     return;
   }
   const singleTop = detectSingleTop(items);
+  await hashExistingItems(items, singleTop);
   renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel);
 }
 
@@ -910,6 +927,8 @@ function computeBatchTargets(items, singleTop, strip){
     const size = item.size;
     const heavy = HEAVY_DIR_PATTERN.test(p);
     const large = size != null && size > LARGE_FILE_THRESHOLD;
+    const exists0 = !invalid && state.pathSet.has(p);
+    const unchanged = exists0 && !!item.sha && item.sha === state.pathShaMap.get(p);
     return {
       item,
       path:p,
@@ -918,8 +937,9 @@ function computeBatchTargets(items, singleTop, strip){
       size,
       heavy,
       large,
-      // 默认勾选：路径合法，且不是疑似构建产物/依赖缓存目录
-      defaultChecked: !invalid && !heavy
+      unchanged,
+      // 默认勾选：路径合法，不是疑似构建产物/依赖缓存目录，且内容和仓库里的不一样
+      defaultChecked: !invalid && !heavy && !unchanged
     };
   });
 }
@@ -937,11 +957,11 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
       </div>`;
     }
     const tags = [];
-    tags.push(t.exists ? '📝覆盖' : '🆕新建');
+    tags.push(t.unchanged ? '⏭️无变化' : (t.exists ? '📝覆盖' : '🆕新建'));
     if(t.heavy) tags.push('⚠️疑似构建产物/缓存目录');
     if(t.large) tags.push(`⚠️${formatBytes(t.size)}，可能超出GitHub单文件上传限制`);
     const sizeStr = t.size != null ? `<span style="opacity:.6;"> (${formatBytes(t.size)})</span>` : '';
-    return `<label style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;cursor:pointer;">
+    return `<label style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;cursor:pointer;${t.unchanged ? 'opacity:.55;' : ''}">
       <input type="checkbox" class="target-check" data-idx="${idx}" ${t.defaultChecked ? 'checked' : ''} style="margin-top:3px;">
       <span class="path mono">${tags.join(' ')} — ${escapeHtml(t.path)}${sizeStr}</span>
     </label>`;
@@ -964,7 +984,8 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
       <div class="note">${sourceLabel}内共 ${items.length} 个文件，确认下面的目标路径无误后再上传：</div>
       ${junkNote}
       ${stripCheckboxHtml}
-      <div class="note" style="margin-top:6px;">未勾选的行不会上传（默认取消勾选疑似构建产物/缓存目录、以及路径不合法的条目）：</div>
+      <div class="note" style="margin-top:6px;">未勾选的行不会上传（默认不勾选：内容和仓库里完全一样的、疑似构建产物/缓存目录、路径不合法的）：</div>
+      <div class="note unchanged-note" style="margin-top:4px;font-weight:600;"></div>
       <div class="zip-target-list"></div>
       <div class="ambiguous">
         <button class="confirm-btn confirm-batch">确认上传已勾选的文件</button>
@@ -984,7 +1005,7 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
     return checkedState.filter(Boolean).length;
   }
   function updateConfirmLabel(){
-    confirmBtn.textContent = `确认上传已勾选的 ${countChecked()} 个文件`;
+    confirmBtn.textContent = countChecked() === 0 ? '没有需要上传的文件（没有勾选）' : `确认上传已勾选的 ${countChecked()} 个文件`;
     confirmBtn.disabled = countChecked() === 0;
   }
 
@@ -992,6 +1013,10 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
     currentTargets = computeBatchTargets(items, singleTop, checkbox ? checkbox.checked : false);
     checkedState = currentTargets.map(t => t.defaultChecked);
     listEl.innerHTML = renderList(currentTargets);
+    const nUnchanged = currentTargets.filter(t => t.unchanged).length;
+    el.querySelector('.unchanged-note').textContent = nUnchanged
+      ? `其中 ${nUnchanged} 个和仓库里的内容完全一样（标「⏭️无变化」），已默认取消勾选，不会重复上传；其余 ${currentTargets.length - nUnchanged} 个有变化或是新文件`
+      : '';
     updateConfirmLabel();
   }
   refresh();
