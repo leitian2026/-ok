@@ -198,6 +198,25 @@
   .log-item.ok{border-color:color-mix(in srgb, var(--ok) 40%, var(--line));}
   .log-item.err{border-color:color-mix(in srgb, var(--danger) 45%, var(--line));}
   .log-item.pending{opacity:.6;}
+  .log-item.needs-action{
+    opacity:1;
+    border:2px solid var(--amber);
+    background:color-mix(in srgb, var(--amber) 12%, var(--card));
+  }
+  .action-tag{
+    font-size:14px;
+    font-weight:700;
+    color:var(--amber);
+    margin-bottom:8px;
+  }
+  .needs-action .path-select, .needs-action input.path-input{
+    font-size:15px;
+    border:2px solid var(--amber);
+  }
+  .needs-action .confirm-btn{
+    padding:13px;
+    font-size:15px;
+  }
   .ambiguous{
     margin-top:10px;
   }
@@ -309,6 +328,17 @@ function getLastDir(){
 }
 function setLastDir(dir){
   try{ if(dir) localStorage.setItem('repoUploaderLastDir', dir); }catch(e){}
+}
+
+function getPick(base){
+  try{ const m = JSON.parse(localStorage.getItem('repoUploaderPicks') || '{}'); return m[base] || ''; }catch(e){ return ''; }
+}
+function setPick(base, path){
+  try{
+    const m = JSON.parse(localStorage.getItem('repoUploaderPicks') || '{}');
+    m[base] = path;
+    localStorage.setItem('repoUploaderPicks', JSON.stringify(m));
+  }catch(e){}
 }
 
 function loadSettings(){
@@ -577,6 +607,17 @@ async function uploadOne(path, arrayBuffer, noteExtra){
   }
 }
 
+// 需要用户动手确认的卡片：高亮、加提示条，并自动滚动到屏幕中间，避免被淹没在下方的日志里
+function flagNeedsAction(el, label){
+  el.classList.add('needs-action');
+  const tag = document.createElement('div');
+  tag.className = 'action-tag';
+  tag.textContent = '⚠️ ' + label;
+  const body = el.querySelector('.body');
+  if(body) body.insertBefore(tag, body.firstChild);
+  setTimeout(()=>{ try{ el.scrollIntoView({behavior:'smooth', block:'center'}); }catch(e){} }, 60);
+}
+
 function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
   const id = 'n' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
@@ -597,6 +638,7 @@ function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
       </div>
     </div>`;
   $('log').prepend(el);
+  flagNeedsAction(el, '需要你确认：这是新文件，检查路径后点“确认上传”');
   const errEl = el.querySelector('.path-error');
   el.querySelector('.confirm-btn').onclick = ()=>{
     const val = el.querySelector('.path-input').value.trim().replace(/^\/+/, '');
@@ -617,13 +659,24 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
-  const options = candidates.map((p,i)=>`<option value="${i}">${escapeHtml(p)}</option>`).join('');
+  // 修复：以前下拉框默认选中第一个候选（树里排最前的往往是仓库根目录那份），
+  // 不改直接点"确认上传"就覆盖到了根目录。现在：
+  //  1) 候选按目录从深到浅排序，根目录的同名文件排最后；
+  //  2) 有多个候选时，默认停在"请选择"，不选就不能确认；
+  //  3) 只有一个候选，或者之前明确选过某个路径，才会预先选中；
+  //  4) 选中根目录文件而别处还有同名文件时，给出醒目提醒。
+  const sorted = candidates.slice().sort((x, y) => y.split('/').length - x.split('/').length);
+  const remembered = getPick(baseName);
+  let preIdx = remembered ? sorted.indexOf(remembered) : -1;
+  if(preIdx < 0 && sorted.length === 1) preIdx = 0;
+  const options = `<option value="" ${preIdx < 0 ? 'selected' : ''} disabled>— 请选择要覆盖的路径 —</option>`
+    + sorted.map((p,i)=>`<option value="${i}" ${i === preIdx ? 'selected' : ''}>${escapeHtml(p)}</option>`).join('');
   const warnNote = (fileSize != null && fileSize > LARGE_FILE_THRESHOLD)
     ? `<div class="note" style="color:var(--amber);">⚠️ ${formatBytes(fileSize)}，可能超出 GitHub 单文件上传限制（约1MB）</div>`
     : '';
-  const matchNote = candidates.length > 1
-    ? '仓库里有多个同名文件，选一个完整路径再确认：'
-    : `仓库里已有同名文件（${escapeHtml(candidates[0])}），确认是覆盖它，还是新建一个不相干的文件：`;
+  const matchNote = sorted.length > 1
+    ? '仓库里有多个同名文件，先选一个完整路径，再确认：'
+    : `仓库里已有同名文件（${escapeHtml(sorted[0])}），确认是覆盖它，还是新建一个不相干的文件：`;
   el.innerHTML = `<div class="icon">❓</div>
     <div class="body">
       <div class="path mono">${escapeHtml(baseName)}</div>
@@ -634,18 +687,43 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
           ${options}
           <option value="new">＋ 都不是，新建于 ${escapeHtml(fallback)}</option>
         </select>
+        <div class="note path-warn" style="color:var(--amber);display:none;"></div>
         <button class="confirm-btn">确认上传</button>
       </div>
     </div>`;
   $('log').prepend(el);
-  el.querySelector('.confirm-btn').onclick = ()=>{
-    const sel = el.querySelector('.path-select');
+  flagNeedsAction(el, sorted.length > 1 ? '需要你选择：仓库里有多个同名文件，选对路径再点“确认上传”' : '需要你确认：仓库里已有同名文件，点“确认上传”才会覆盖');
+  const sel = el.querySelector('.path-select');
+  const btn = el.querySelector('.confirm-btn');
+  const warnEl = el.querySelector('.path-warn');
+  function sync(){
     const v = sel.value;
+    btn.disabled = (v === '');
+    let warn = '';
+    if(v === 'new'){
+      if(!fallback.includes('/')) warn = '⚠️ 这会把文件新建在仓库根目录，确认不是放错了位置';
+    }else if(v !== ''){
+      const p = sorted[parseInt(v,10)];
+      const others = sorted.filter(x => x !== p);
+      if(!p.includes('/') && others.some(x => x.includes('/'))){
+        warn = `⚠️ 你选的是仓库根目录的文件，但子文件夹里还有同名文件（${others.find(x => x.includes('/'))}）。源码一般在子文件夹里，确认没选错`;
+      }
+    }
+    warnEl.textContent = warn;
+    warnEl.style.display = warn ? 'block' : 'none';
+  }
+  sel.addEventListener('change', sync);
+  sync();
+  btn.onclick = ()=>{
+    const v = sel.value;
+    if(v === '') return;
     el.remove();
     if(v === 'new'){
       uploadOne(fallback, arrayBuffer, '新建');
     }else{
-      uploadOne(candidates[parseInt(v,10)], arrayBuffer, '手动选择');
+      const path = sorted[parseInt(v,10)];
+      setPick(baseName, path);
+      uploadOne(path, arrayBuffer, '手动选择');
     }
   };
 }
@@ -894,6 +972,7 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
       </div>
     </div>`;
   $('log').prepend(el);
+  flagNeedsAction(el, '需要你确认：检查下面的目标路径，再点“确认上传”');
 
   const listEl = el.querySelector('.zip-target-list');
   const checkbox = el.querySelector('.strip-top');
@@ -949,6 +1028,7 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
 
 async function handleFiles(fileList){
   $('uploadStatus').textContent = '正在处理…';
+  $('uploadStatus').style.color = ''; $('uploadStatus').style.fontWeight = ''; $('uploadStatus').style.fontSize = '';
   const files = Array.from(fileList);
   let skippedJunk = 0, autoOk = 0, autoFail = 0, pending = 0;
   for(const file of files){
@@ -984,6 +1064,9 @@ async function handleFiles(fileList){
   if(pending) parts.push(`${pending} 个待你确认路径`);
   if(skippedJunk) parts.push(`${skippedJunk} 个系统垃圾文件已跳过`);
   $('uploadStatus').textContent = parts.length ? '处理完成：' + parts.join('，') : '处理完成';
+  $('uploadStatus').style.color = pending ? 'var(--amber)' : '';
+  $('uploadStatus').style.fontWeight = pending ? '700' : '';
+  $('uploadStatus').style.fontSize = pending ? '14px' : '';
 }
 
 $('fileInput').addEventListener('change', e=>{
