@@ -634,13 +634,32 @@ function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
       <div class="ambiguous">
         <input type="text" class="path-input mono" value="${escapeHtml(suggestedPath)}">
         <div class="note path-error" style="color:var(--danger);display:none;"></div>
+        <label class="ack-row" style="display:none;align-items:center;gap:6px;margin:8px 0;font-size:13px;cursor:pointer;">
+          <input type="checkbox" class="ack-check"> 我确认：这个路径在仓库里已有同名文件，覆盖它
+        </label>
         <button class="confirm-btn">确认上传</button>
       </div>
     </div>`;
   $('log').prepend(el);
   flagNeedsAction(el, '需要你确认：这是新文件，检查路径后点“确认上传”');
   const errEl = el.querySelector('.path-error');
+  const newInput = el.querySelector('.path-input');
+  const newAckRow = el.querySelector('.ack-row');
+  const newAck = el.querySelector('.ack-check');
+  const newBtn = el.querySelector('.confirm-btn');
+  // 手填的路径恰好是仓库里已有的文件：不再静默覆盖，必须勾选确认
+  function syncNew(){
+    const v = newInput.value.trim().replace(/^\/+/, '');
+    const exists = !!v && state.pathSet.has(v);
+    newAckRow.style.display = exists ? 'flex' : 'none';
+    if(!exists) newAck.checked = false;
+    newBtn.disabled = exists && !newAck.checked;
+  }
+  newInput.addEventListener('input', syncNew);
+  newAck.addEventListener('change', syncNew);
+  syncNew();
   el.querySelector('.confirm-btn').onclick = ()=>{
+    if(newBtn.disabled) return;
     const val = el.querySelector('.path-input').value.trim().replace(/^\/+/, '');
     if(!val) return;
     if(hasPathTraversal(val)){
@@ -688,17 +707,32 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
           <option value="new">＋ 都不是，新建于 ${escapeHtml(fallback)}</option>
         </select>
         <div class="note path-warn" style="color:var(--amber);display:none;"></div>
+        <label class="ack-row" style="display:flex;align-items:center;gap:6px;margin:8px 0;font-size:13px;cursor:pointer;">
+          <input type="checkbox" class="ack-check"> 我确认：覆盖仓库里已有的这个同名文件
+        </label>
         <button class="confirm-btn">确认上传</button>
       </div>
     </div>`;
   $('log').prepend(el);
-  flagNeedsAction(el, sorted.length > 1 ? '需要你选择：仓库里有多个同名文件，选对路径再点“确认上传”' : '需要你确认：仓库里已有同名文件，点“确认上传”才会覆盖');
+  flagNeedsAction(el, sorted.length > 1 ? '需要你选择：仓库里有多个同名文件，选对路径、勾选“我确认”后才能上传' : '需要你确认：仓库里已有同名文件，勾选“我确认”后才能上传');
   const sel = el.querySelector('.path-select');
   const btn = el.querySelector('.confirm-btn');
   const warnEl = el.querySelector('.path-warn');
+  const ackRow = el.querySelector('.ack-row');
+  const ack = el.querySelector('.ack-check');
+  // 选的是已有文件（会覆盖）→ 必须勾选确认；新建到一个仓库里还不存在的路径 → 不需要
+  function needAck(){
+    const v = sel.value;
+    if(v === '') return true;
+    if(v === 'new') return state.pathSet.has(fallback);
+    return true;
+  }
   function sync(){
     const v = sel.value;
-    btn.disabled = (v === '');
+    const need = needAck();
+    ackRow.style.display = need ? 'flex' : 'none';
+    if(!need) ack.checked = false;
+    btn.disabled = (v === '') || (need && !ack.checked);
     let warn = '';
     if(v === 'new'){
       if(!fallback.includes('/')) warn = '⚠️ 这会把文件新建在仓库根目录，确认不是放错了位置';
@@ -712,11 +746,14 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
     warnEl.textContent = warn;
     warnEl.style.display = warn ? 'block' : 'none';
   }
-  sel.addEventListener('change', sync);
+  // 换了目标路径就要重新确认，避免对着上一个选择勾的"我确认"误传到别的文件
+  sel.addEventListener('change', ()=>{ ack.checked = false; sync(); });
+  ack.addEventListener('change', sync);
   sync();
   btn.onclick = ()=>{
     const v = sel.value;
     if(v === '') return;
+    if(needAck() && !ack.checked) return;
     el.remove();
     if(v === 'new'){
       uploadOne(fallback, arrayBuffer, '新建');
@@ -752,6 +789,10 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
 //    单个/多个零散文件（不经过文件夹或压缩包选择）走 handleFiles 里原有的
 //    "按文件名智能匹配"流程，但也补上了系统垃圾文件过滤、大文件警告、
 //    手填路径的穿越校验，以及处理完成后的批量汇总。
+// 10) 单个文件的同名保护：单个文件没有路径信息，只能按文件名去仓库里猜，容易覆盖错位置，所以
+//    - 仓库里有同名文件时，确认框里多一个"我确认覆盖"勾选，不勾选"确认上传"按钮是灰的；
+//    - 手填路径恰好撞上已有文件时，同样要勾选确认。
+//    压缩包/文件夹/拖放自带完整路径，"同名不同路径"本来就是不同文件，不受这条限制。
 // 9) 压缩包/文件夹/拖放只有一个最外层文件夹时，"要不要去掉这层"不再一律默认去掉，
 //    而是看仓库里已有的内容来自动判断（decideStrip）：
 //    - 按原路径能对上的已有文件更多 → 保留这层（例如只含 app/ 的更新包，仓库里本来就有 app/）
