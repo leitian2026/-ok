@@ -752,6 +752,12 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
 //    单个/多个零散文件（不经过文件夹或压缩包选择）走 handleFiles 里原有的
 //    "按文件名智能匹配"流程，但也补上了系统垃圾文件过滤、大文件警告、
 //    手填路径的穿越校验，以及处理完成后的批量汇总。
+// 9) 压缩包/文件夹/拖放只有一个最外层文件夹时，"要不要去掉这层"不再一律默认去掉，
+//    而是看仓库里已有的内容来自动判断（decideStrip）：
+//    - 按原路径能对上的已有文件更多 → 保留这层（例如只含 app/ 的更新包，仓库里本来就有 app/）
+//    - 去掉这层后能对上的更多 → 去掉（例如整个项目外面套了一层文件夹）
+//    - 都对不上 → 仅当像典型外壳（xxx-main、和压缩包/仓库同名、里面有多个项目根文件）才去掉
+//    判断依据会显示在预览里，勾选框仍可手动改。
 
 const JUNK_PATTERNS = [
   /(^|\/)__MACOSX(\/|$)/,
@@ -786,6 +792,43 @@ function detectSingleTop(items){
   return (tops.size === 1 && allNested) ? [...tops][0] : null;
 }
 
+// 项目根目录里常见的标志文件：去掉外壳后，如果有多个这类文件落在根目录，说明那层确实是外壳
+const ROOT_MARKER_PATTERN = /^(settings\.gradle(\.kts)?|build\.gradle(\.kts)?|gradle\.properties|package\.json|pom\.xml|Cargo\.toml|go\.mod|pyproject\.toml|requirements\.txt|Dockerfile|README(\.md)?|index\.html|\.gitignore|\.github\/.+)$/i;
+
+// 根据仓库里已有的内容，判断单一顶层文件夹到底是"外壳"（该去掉）还是"真实目录"（该保留）
+function decideStrip(items, singleTop, batchName){
+  if(!singleTop) return {strip:false, reason:''};
+  const prefix = singleTop + '/';
+  let asIs = 0, stripped = 0, markers = 0;
+  for(const i of items){
+    if(state.pathSet.has(i.name)) asIs++;
+    const s = i.name.slice(prefix.length);
+    if(s && state.pathSet.has(s)) stripped++;
+    if(s && ROOT_MARKER_PATTERN.test(s)) markers++;
+  }
+  if(asIs > stripped){
+    return {strip:false, reason:`仓库里已有「${singleTop}/」目录，按原路径能对上 ${asIs} 个已有文件（去掉这层只能对上 ${stripped} 个），所以保留这层目录，不去掉。`};
+  }
+  if(stripped > asIs){
+    return {strip:true, reason:`去掉这层后能对上 ${stripped} 个仓库已有文件（保留只能对上 ${asIs} 个），所以判断它是外壳，已默认去掉。`};
+  }
+  // 两种都对不上（或一样多）：看仓库里有没有这个目录，再看像不像典型外壳
+  let repoHasTop = false;
+  for(const p of state.pathSet){ if(p.startsWith(prefix)){ repoHasTop = true; break; } }
+  if(repoHasTop){
+    return {strip:false, reason:`仓库里已有「${singleTop}/」目录，保留这层目录，文件会放进去。`};
+  }
+  const zipBase = String(batchName || '').replace(/\.zip$/i, '');
+  const looksWrapper = /-(main|master)$/i.test(singleTop)
+    || singleTop === zipBase
+    || singleTop.toLowerCase() === String(state.repo || '').toLowerCase()
+    || markers >= 2;
+  if(looksWrapper){
+    return {strip:true, reason:`仓库里没有「${singleTop}/」目录，而且它像压缩包的外壳文件夹，已默认去掉。`};
+  }
+  return {strip:false, reason:`仓库里没有「${singleTop}/」目录，也不像外壳文件夹，所以保留这层目录（文件会放进「${singleTop}/」里）。如果它其实是外壳，请勾选下面的选项。`};
+}
+
 // items: [{name, size, getData:()=>Promise<ArrayBuffer>}]
 // 把"压缩包/文件夹里的文件"和"仓库里同路径的文件"按 git blob sha 比对，
 // 内容完全一样的标为"无变化"，预览里默认不勾选，不会重复上传。
@@ -813,7 +856,8 @@ async function prepareBatch(batchName, rawItems, icon, sourceLabel){
   }
   const singleTop = detectSingleTop(items);
   await hashExistingItems(items, singleTop);
-  renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel);
+  const stripInfo = decideStrip(items, singleTop, batchName);
+  renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel, stripInfo);
 }
 
 async function handleZipFile(file){
@@ -944,7 +988,7 @@ function computeBatchTargets(items, singleTop, strip){
   });
 }
 
-function renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel){
+function renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel, stripInfo){
   const id = 'bp' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
   el.className = 'log-item pending';
@@ -969,9 +1013,10 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
 
   const stripCheckboxHtml = singleTop
     ? `<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-soft);margin:8px 0;">
-         <input type="checkbox" class="strip-top" checked>
+         <input type="checkbox" class="strip-top" ${stripInfo && stripInfo.strip ? 'checked' : ''}>
          检测到最外层文件夹「${escapeHtml(singleTop)}/」，去掉这层，内容直接放到目标目录下
-       </label>`
+       </label>
+       <div class="note" style="margin:-4px 0 8px;">${escapeHtml(stripInfo ? stripInfo.reason : '')}</div>`
     : '';
 
   const junkNote = junkCount > 0
