@@ -706,6 +706,9 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
           ${options}
           <option value="new">＋ 都不是，新建于 ${escapeHtml(fallback)}</option>
         </select>
+        <input type="text" class="path-input mono new-path" style="display:none;margin-top:8px;" value="${escapeHtml(fallback)}" placeholder="新建路径，例如 app/${escapeHtml(baseName)}">
+        <div class="note new-path-hint" style="display:none;">选了"新建"：可以直接改上面的路径，要放进文件夹就写成 文件夹名/${escapeHtml(baseName)}（只写 文件夹名/ 会自动补上文件名）</div>
+        <div class="note path-error" style="color:var(--danger);display:none;"></div>
         <div class="note path-warn" style="color:var(--amber);display:none;"></div>
         <label class="ack-row" style="display:flex;align-items:center;gap:6px;margin:8px 0;font-size:13px;cursor:pointer;">
           <input type="checkbox" class="ack-check"> 我确认：覆盖仓库里已有的这个同名文件
@@ -721,21 +724,44 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
   const ackRow = el.querySelector('.ack-row');
   const ack = el.querySelector('.ack-check');
   // 选的是已有文件（会覆盖）→ 必须勾选确认；新建到一个仓库里还不存在的路径 → 不需要
+  const newInput = el.querySelector('.new-path');
+  const newHint = el.querySelector('.new-path-hint');
+  const errEl = el.querySelector('.path-error');
+  // 手填路径规整：去首尾空格、反斜杠转斜杠、去开头的"/"；只写了文件夹（以"/"结尾）就自动补文件名
+  function newPathValue(){
+    let v = newInput.value.trim().replace(/\\/g, '/').replace(/^\/+/, '');
+    if(v.endsWith('/')) v += baseName;
+    return v;
+  }
+  function newPathError(){
+    const v = newPathValue();
+    if(!v) return '路径不能为空';
+    if(hasPathTraversal(v)) return '路径不合法（不能包含 ".." 或 "."），改一下再确认';
+    return '';
+  }
   function needAck(){
     const v = sel.value;
     if(v === '') return true;
-    if(v === 'new') return state.pathSet.has(fallback);
+    if(v === 'new') return state.pathSet.has(newPathValue());   // 手填的路径恰好是仓库已有文件 → 要勾选确认
     return true;
   }
   function sync(){
     const v = sel.value;
+    const isNew = v === 'new';
+    newInput.style.display = isNew ? '' : 'none';
+    newHint.style.display = isNew ? 'block' : 'none';
+    const err = isNew ? newPathError() : '';
+    errEl.textContent = err;
+    errEl.style.display = err ? 'block' : 'none';
     const need = needAck();
     ackRow.style.display = need ? 'flex' : 'none';
     if(!need) ack.checked = false;
-    btn.disabled = (v === '') || (need && !ack.checked);
+    btn.disabled = (v === '') || !!err || (need && !ack.checked);
     let warn = '';
     if(v === 'new'){
-      if(!fallback.includes('/')) warn = '⚠️ 这会把文件新建在仓库根目录，确认不是放错了位置';
+      const np = newPathValue();
+      if(!err && state.pathSet.has(np)) warn = '⚠️ 这个路径在仓库里已有同名文件，上传会覆盖它';
+      else if(!err && !np.includes('/')) warn = '⚠️ 这会把文件新建在仓库根目录，确认不是放错了位置';
     }else if(v !== ''){
       const p = sorted[parseInt(v,10)];
       const others = sorted.filter(x => x !== p);
@@ -747,16 +773,25 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
     warnEl.style.display = warn ? 'block' : 'none';
   }
   // 换了目标路径就要重新确认，避免对着上一个选择勾的"我确认"误传到别的文件
-  sel.addEventListener('change', ()=>{ ack.checked = false; sync(); });
+  sel.addEventListener('change', ()=>{
+    ack.checked = false;
+    if(sel.value === 'new'){ setTimeout(()=>{ try{ newInput.focus(); newInput.select(); }catch(e){} }, 0); }
+    sync();
+  });
+  // 改了路径同样要重新确认，避免对着上一个路径勾的"我确认"误覆盖到别的文件
+  newInput.addEventListener('input', ()=>{ ack.checked = false; sync(); });
   ack.addEventListener('change', sync);
   sync();
   btn.onclick = ()=>{
     const v = sel.value;
     if(v === '') return;
     if(needAck() && !ack.checked) return;
+    if(v === 'new' && newPathError()){ sync(); return; }
     el.remove();
     if(v === 'new'){
-      uploadOne(fallback, arrayBuffer, '新建');
+      const np = newPathValue();
+      setLastDir(np.includes('/') ? np.slice(0, np.lastIndexOf('/')) : '');
+      uploadOne(np, arrayBuffer, '新建');
     }else{
       const path = sorted[parseInt(v,10)];
       setPick(baseName, path);
@@ -1156,14 +1191,11 @@ async function handleFiles(fileList){
     if(target.type === 'ambiguous'){
       pending++;
       showAmbiguousChoice(file.name, target.candidates, target.fallback, content, file.size);
-    }else if(target.type === 'byname'){
-      // 仓库里恰好有一个同名文件：不再直接静默覆盖，必须用户确认
-      pending++;
-      showAmbiguousChoice(file.name, [target.path], file.name, content, file.size);
     }else if(target.type === 'new'){
       pending++;
       showNewFileConfirm(file.name, target.path, content, file.size);
     }else{
+      // 仓库里只有一个同名文件 = 正常更新，直接覆盖；有 2 个以上同名才需要选（上面的 ambiguous 分支）
       const sizeNote = file.size > LARGE_FILE_THRESHOLD ? `（⚠️${formatBytes(file.size)}，注意GitHub单文件上传限制）` : '';
       const ok = await uploadOne(target.path, content, '按文件名匹配到仓库路径' + sizeNote);
       if(ok) autoOk++; else autoFail++;
