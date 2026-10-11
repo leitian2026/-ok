@@ -65,8 +65,9 @@
   header{
     padding-top: env(safe-area-inset-top, 0px);
     display:flex;
-    align-items:baseline;
+    align-items:center;
     justify-content:space-between;
+    gap:12px;
     margin-bottom:22px;
   }
   h1{
@@ -76,15 +77,20 @@
     margin:0;
   }
   .repo-tag{
-    font-size:13px;
-    color:var(--ink-soft);
+    font-size:16px;
+    font-weight:700;
+    color:var(--teal-deep);
     cursor:pointer;
-    text-decoration:underline;
-    text-underline-offset:3px;
-    background:none;
-    border:none;
-    padding:0;
+    background:color-mix(in srgb, var(--teal) 16%, var(--card));
+    border:1.5px solid var(--teal);
+    border-radius:999px;
+    padding:7px 14px;
     font-family:inherit;
+    max-width:62%;
+    min-width:0;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
   }
   .card{
     background:var(--card);
@@ -198,6 +204,29 @@
   .log-item.ok{border-color:color-mix(in srgb, var(--ok) 40%, var(--line));}
   .log-item.err{border-color:color-mix(in srgb, var(--danger) 45%, var(--line));}
   .log-item.pending{opacity:.6;}
+  /* 批量上传完成的汇总条：和单个文件的记录区分开 */
+  .log-item.summary{
+    align-items:center;
+    gap:12px;
+    padding:16px 14px;
+    border-width:2px;
+    border-radius:12px;
+    background:color-mix(in srgb, var(--teal) 16%, var(--card));
+    border-color:var(--teal);
+  }
+  .log-item.summary.err{
+    background:color-mix(in srgb, var(--danger) 14%, var(--card));
+    border-color:var(--danger);
+  }
+  .log-item.summary .icon{font-size:24px; width:28px; line-height:1;}
+  .log-item.summary .path{font-size:13px; color:var(--ink-soft);}
+  .log-item.summary .note{
+    font-size:16px;
+    font-weight:700;
+    margin-top:4px;
+    color:var(--teal-deep);
+  }
+  .log-item.summary.err .note{color:var(--danger);}
   .log-item.needs-action{
     opacity:1;
     border:2px solid var(--amber);
@@ -542,9 +571,9 @@ function arrayBufferToBase64(buffer){
 }
 
 // ---- 日志 UI ----
-function addLogItem(id, path, statusText, cls){
+function addLogItem(id, path, statusText, cls, extra){
   const el = document.createElement('div');
-  el.className = 'log-item ' + cls;
+  el.className = 'log-item ' + cls + (extra ? ' ' + extra : '');
   el.id = 'log-' + id;
   el.innerHTML = `<div class="icon">${cls==='ok'?'✅':cls==='err'?'❌':'⏳'}</div>
     <div class="body"><div class="path mono">${escapeHtml(path)}</div><div class="note">${escapeHtml(statusText)}</div></div>`;
@@ -1167,7 +1196,7 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
     const summary = failCount === 0
       ? `批量上传完成：${okCount} 个全部成功`
       : `批量上传完成：${okCount} 个成功，${failCount} 个失败（失败原因见上方对应记录）`;
-    addLogItem('sum'+Math.random(), batchName, summary, cls);
+    addLogItem('sum'+Math.random(), batchName, summary, cls, 'summary');
   };
 }
 
