@@ -370,6 +370,67 @@ function setPick(base, path){
   }catch(e){}
 }
 
+// ---- 防传错仓库的辅助函数 ----
+// 当前连接的仓库快照：预览卡片创建时记一份，确认上传时比对，
+// 避免"先拖进文件、再切换仓库、然后确认"把文件传到新仓库。
+function snapshotRepo(){
+  return {owner: state.owner, repo: state.repo, branch: state.branch};
+}
+function sameRepo(snap){
+  return !!snap && snap.owner === state.owner && snap.repo === state.repo && snap.branch === state.branch;
+}
+// 每个仓库按名字固定一个颜色：顶部标签和预览卡片左边框用同一种颜色，一眼分辨
+function repoColor(full){
+  let h = 0;
+  for(const ch of String(full).toLowerCase()){ h = (h * 31 + ch.charCodeAt(0)) >>> 0; }
+  return `hsl(${h % 360}, 58%, 46%)`;
+}
+function repoBannerHtml(snap){
+  const name = `${snap.owner}/${snap.repo}`;
+  const c = repoColor(name);
+  return `<div class="repo-banner" style="margin:6px 0;padding:7px 10px;border-left:5px solid ${c};border-radius:6px;background:color-mix(in srgb, ${c} 12%, var(--card));font-size:13px;">将上传到 <b class="mono">${escapeHtml(name)}</b> · 分支 <span class="mono">${escapeHtml(snap.branch)}</span></div>`;
+}
+// 记住"压缩包/文件夹名 → 上次传到的仓库"
+function getZipRepo(name){
+  try{ const m = JSON.parse(localStorage.getItem('repoUploaderZipRepos') || '{}'); return m[name] || ''; }catch(e){ return ''; }
+}
+function setZipRepo(name, repoName){
+  try{
+    const m = JSON.parse(localStorage.getItem('repoUploaderZipRepos') || '{}');
+    m[name] = repoName;
+    localStorage.setItem('repoUploaderZipRepos', JSON.stringify(m));
+  }catch(e){}
+}
+// 切换仓库后，之前还没确认的卡片（路径是按旧仓库算的）全部作废
+function invalidatePendingCards(){
+  const cards = document.querySelectorAll('#log .log-item.needs-action');
+  if(!cards.length) return;
+  const n = cards.length;
+  cards.forEach(c => c.remove());
+  addLogItem('sw'+Math.random(), '已切换仓库', `有 ${n} 张待确认的卡片已作废（路径是按上一个仓库算的），请重新选择文件`, 'err');
+}
+// 压缩包路径和当前仓库已有路径的重合情况（去掉外壳文件夹前后取较大值）
+function computeOverlap(items, singleTop){
+  const prefix = singleTop ? singleTop + '/' : null;
+  let total = 0, asIs = 0, stripped = 0, nameMatch = 0, nameExample = '';
+  for(const i of items){
+    if(HEAVY_DIR_PATTERN.test(i.name)) continue;
+    total++;
+    if(state.pathSet.has(i.name)) asIs++;
+    if(prefix){
+      const s = i.name.slice(prefix.length);
+      if(s && state.pathSet.has(s)) stripped++;
+    }
+    // 路径对不上时，看文件名能不能对上（README、build.gradle 这类到处都有的通用文件名不算）
+    const base = i.name.split('/').pop();
+    if(!ROOT_MARKER_PATTERN.test(base) && state.basenameMap.has(base)){
+      nameMatch++;
+      if(!nameExample) nameExample = `${base} → ${state.basenameMap.get(base)[0]}`;
+    }
+  }
+  return {total, best: Math.max(asIs, stripped), nameMatch, nameExample};
+}
+
 function loadSettings(){
   try{
     const raw = localStorage.getItem('repoUploaderCfg');
@@ -439,7 +500,9 @@ async function saveSettings(){
     return;
   }
   const [owner, repo] = repoFull.split('/');
+  const switched = !!state.owner && (state.owner !== owner || state.repo !== repo || state.branch !== branch);
   state.token = token; state.owner = owner; state.repo = repo; state.branch = branch;
+  if(switched) invalidatePendingCards();
   statusEl.style.color = 'var(--ink-soft)';
   statusEl.textContent = '正在连接…';
   try{
@@ -457,7 +520,12 @@ async function saveSettings(){
 }
 
 function updateRepoTag(){
-  $('repoTag').textContent = `${state.owner}/${state.repo} · ${state.branch}`;
+  const tag = $('repoTag');
+  tag.textContent = `${state.owner}/${state.repo} · ${state.branch}`;
+  const c = repoColor(`${state.owner}/${state.repo}`);
+  tag.style.borderColor = c;
+  tag.style.color = c;
+  tag.style.background = `color-mix(in srgb, ${c} 14%, var(--card))`;
 }
 
 async function ghFetch(url, options={}){
@@ -649,6 +717,7 @@ function flagNeedsAction(el, label){
 
 function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
   const id = 'n' + Math.random().toString(36).slice(2);
+  const snap = snapshotRepo();
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
@@ -658,6 +727,7 @@ function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
   el.innerHTML = `<div class="icon">🆕</div>
     <div class="body">
       <div class="path mono">${escapeHtml(fileName)}</div>
+      ${repoBannerHtml(snap)}
       <div class="note">仓库里没有同名文件。确认新建路径，要放进新文件夹就在前面加"文件夹名/"：</div>
       ${warnNote}
       <div class="ambiguous">
@@ -691,6 +761,12 @@ function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
     if(newBtn.disabled) return;
     const val = el.querySelector('.path-input').value.trim().replace(/^\/+/, '');
     if(!val) return;
+    if(!sameRepo(snap)){
+      errEl.textContent = '仓库已切换，这张卡片已失效，请重新选择文件';
+      errEl.style.display = 'block';
+      newBtn.disabled = true;
+      return;
+    }
     if(hasPathTraversal(val)){
       errEl.textContent = '路径不合法（不能包含 ".." 或以 "/" 开头），改一下再确认';
       errEl.style.display = 'block';
@@ -704,6 +780,7 @@ function showNewFileConfirm(fileName, suggestedPath, arrayBuffer, fileSize){
 
 function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSize){
   const id = 'a' + Math.random().toString(36).slice(2);
+  const snap = snapshotRepo();
   const el = document.createElement('div');
   el.className = 'log-item pending';
   el.id = 'log-' + id;
@@ -728,6 +805,7 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
   el.innerHTML = `<div class="icon">❓</div>
     <div class="body">
       <div class="path mono">${escapeHtml(baseName)}</div>
+      ${repoBannerHtml(snap)}
       <div class="note">${matchNote}</div>
       ${warnNote}
       <div class="ambiguous">
@@ -815,6 +893,12 @@ function showAmbiguousChoice(baseName, candidates, fallback, arrayBuffer, fileSi
     const v = sel.value;
     if(v === '') return;
     if(needAck() && !ack.checked) return;
+    if(!sameRepo(snap)){
+      errEl.textContent = '仓库已切换，这张卡片已失效，请重新选择文件';
+      errEl.style.display = 'block';
+      btn.disabled = true;
+      return;
+    }
     if(v === 'new' && newPathError()){ sync(); return; }
     el.remove();
     if(v === 'new'){
@@ -959,10 +1043,16 @@ async function prepareBatch(batchName, rawItems, icon, sourceLabel){
     addLogItem('b'+Math.random(), batchName, msg, 'err');
     return;
   }
+  const snap = snapshotRepo();
   const singleTop = detectSingleTop(items);
   await hashExistingItems(items, singleTop);
+  if(!sameRepo(snap)){
+    addLogItem('b'+Math.random(), batchName, '处理期间仓库被切换了，这个包的预览已作废，请重新选择', 'err');
+    return;
+  }
   const stripInfo = decideStrip(items, singleTop, batchName);
-  renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel, stripInfo);
+  const overlap = computeOverlap(items, singleTop);
+  renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel, stripInfo, snap, overlap);
 }
 
 async function handleZipFile(file){
@@ -1093,7 +1183,39 @@ function computeBatchTargets(items, singleTop, strip){
   });
 }
 
-function renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel, stripInfo){
+function renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel, stripInfo, snap, overlap){
+  const repoLabel = `${snap.owner}/${snap.repo}`;
+  const color = repoColor(repoLabel);
+  // 路径一个都对不上，按情况分三档：
+  //  - 仓库 ≥20 个文件且文件名也对不上 → 红色拦截，必须勾选确认
+  //  - 文件名能对上（只是目录层级不同）→ 黄色提示，不拦截
+  //  - 仓库只有 1~19 个文件 → 黄色提示（可能只是往小仓库加新文件），不拦截
+  //  - 仓库为空 → 不提示
+  const repoSize = state.pathSet.size;
+  const zeroOverlap = repoSize >= 1 && overlap.total > 0 && overlap.best === 0;
+  const mismatch = zeroOverlap && repoSize >= 20 && overlap.nameMatch === 0;
+  const softNotice = zeroOverlap && !mismatch;
+  const softHtml = softNotice
+    ? `<div style="margin:8px 0;padding:9px 12px;border:2px solid var(--amber);border-radius:10px;background:color-mix(in srgb, var(--amber) 12%, var(--card));font-size:13px;">${
+        overlap.nameMatch > 0
+          ? `⚠️ 包里的路径和仓库一个都对不上，但有 ${overlap.nameMatch} 个文件名能对上（例如 <span class="mono">${escapeHtml(overlap.nameExample)}</span>）。仓库大概率没选错，只是目录层级不同：上传会<b>新建</b>而不是覆盖，请检查下面的路径，必要时勾选/取消“去掉最外层文件夹”`
+          : `⚠️ 包里的 ${overlap.total} 个文件和当前仓库（共 ${repoSize} 个文件）一个都对不上。如果是往这个仓库新增文件就没问题，否则请确认没选错仓库`
+      }</div>`
+    : '';
+  const mismatchHtml = mismatch
+    ? `<div style="margin:8px 0;padding:10px 12px;border:2px solid var(--danger);border-radius:10px;background:color-mix(in srgb, var(--danger) 10%, var(--card));font-size:13px;">
+         <div style="font-weight:700;color:var(--danger);margin-bottom:6px;">🚫 这个包和当前仓库几乎没有重合文件，可能选错仓库了</div>
+         <div class="note">当前仓库已有 ${repoSize} 个文件，而这 ${overlap.total} 个文件里没有一个能按路径或文件名对上（去掉外壳文件夹后也对不上）。</div>
+         <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:13px;cursor:pointer;">
+           <input type="checkbox" class="mismatch-ack"> 我确认就是传到 ${escapeHtml(repoLabel)}
+         </label>
+       </div>`
+    : '';
+  // 上次这个包传到了别的仓库 → 黄色提醒
+  const rememberedRepo = /^拖放的 /.test(batchName) ? '' : getZipRepo(batchName);
+  const rememberedHtml = (rememberedRepo && rememberedRepo !== repoLabel)
+    ? `<div style="margin:8px 0;padding:9px 12px;border:2px solid var(--amber);border-radius:10px;background:color-mix(in srgb, var(--amber) 12%, var(--card));font-size:13px;">⚠️ 上次「${escapeHtml(batchName)}」传到的是 <b class="mono">${escapeHtml(rememberedRepo)}</b>，这次要传到 <b class="mono">${escapeHtml(repoLabel)}</b>，确认没选错仓库</div>`
+    : '';
   const id = 'bp' + Math.random().toString(36).slice(2);
   const el = document.createElement('div');
   el.className = 'log-item pending';
@@ -1131,6 +1253,10 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
   el.innerHTML = `<div class="icon">${icon}</div>
     <div class="body">
       <div class="path mono">${escapeHtml(batchName)}</div>
+      ${repoBannerHtml(snap)}
+      ${mismatchHtml}
+      ${softHtml}
+      ${rememberedHtml}
       <div class="note">${sourceLabel}内共 ${items.length} 个文件，确认下面的目标路径无误后再上传：</div>
       ${junkNote}
       ${stripCheckboxHtml}
@@ -1138,12 +1264,14 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
       <div class="note unchanged-note" style="margin-top:4px;font-weight:600;"></div>
       <div class="zip-target-list"></div>
       <div class="ambiguous">
+        <div class="note stale-note" style="color:var(--danger);font-weight:700;display:none;margin-bottom:8px;"></div>
         <button class="confirm-btn confirm-batch">确认上传已勾选的文件</button>
         <button class="ghost cancel-batch" style="margin-top:8px;">取消</button>
       </div>
     </div>`;
   $('log').prepend(el);
   flagNeedsAction(el, '需要你确认：检查下面的目标路径，再点“确认上传”');
+  el.style.borderLeft = `6px solid ${color}`;  // 仓库专属颜色，和顶部标签一致
 
   const listEl = el.querySelector('.zip-target-list');
   const checkbox = el.querySelector('.strip-top');
@@ -1154,10 +1282,16 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
   function countChecked(){
     return checkedState.filter(Boolean).length;
   }
+  const mismatchAck = el.querySelector('.mismatch-ack');
   function updateConfirmLabel(){
-    confirmBtn.textContent = countChecked() === 0 ? '没有需要上传的文件（没有勾选）' : `确认上传已勾选的 ${countChecked()} 个文件`;
-    confirmBtn.disabled = countChecked() === 0;
+    const n = countChecked();
+    const needAck = mismatch && !(mismatchAck && mismatchAck.checked);
+    confirmBtn.textContent = n === 0
+      ? '没有需要上传的文件（没有勾选）'
+      : (needAck ? `请先勾选上方“我确认就是传到 ${repoLabel}”` : `确认上传已勾选的 ${n} 个文件到 ${repoLabel}`);
+    confirmBtn.disabled = n === 0 || needAck;
   }
+  if(mismatchAck) mismatchAck.addEventListener('change', updateConfirmLabel);
 
   function refresh(){
     currentTargets = computeBatchTargets(items, singleTop, checkbox ? checkbox.checked : false);
@@ -1183,19 +1317,37 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
   el.querySelector('.cancel-batch').onclick = () => el.remove();
 
   confirmBtn.onclick = async () => {
+    // 确认时仓库已经不是预览时的那个 → 拒绝上传
+    if(!sameRepo(snap)){
+      const stale = el.querySelector('.stale-note');
+      stale.textContent = `仓库已切换（预览是按 ${repoLabel} 算的），不能上传。请重新选择压缩包/文件夹`;
+      stale.style.display = 'block';
+      confirmBtn.disabled = true;
+      return;
+    }
     const toUpload = currentTargets.filter((t, idx) => checkedState[idx] && !t.invalid);
     el.remove();
-    let okCount = 0, failCount = 0;
+    let okCount = 0, failCount = 0, aborted = false;
     for(const t of toUpload){
+      if(!sameRepo(snap)){ aborted = true; break; }
       const content = await t.item.getData();
+      // 读文件期间也可能被切换仓库，上传前再确认一次
+      if(!sameRepo(snap)){ aborted = true; break; }
       const note = t.exists ? `覆盖（${sourceLabel}结构确认）` : `新建（${sourceLabel}结构确认）`;
       const ok = await uploadOne(t.path, content, note);
       if(ok) okCount++; else failCount++;
     }
-    const cls = failCount === 0 ? 'ok' : 'err';
-    const summary = failCount === 0
-      ? `批量上传完成：${okCount} 个全部成功`
-      : `批量上传完成：${okCount} 个成功，${failCount} 个失败（失败原因见上方对应记录）`;
+    if(okCount > 0 && !/^拖放的 /.test(batchName)) setZipRepo(batchName, repoLabel);
+    const cls = (failCount === 0 && !aborted) ? 'ok' : 'err';
+    let summary;
+    if(aborted){
+      const left = toUpload.length - okCount - failCount;
+      summary = `已中止：上传中途仓库被切换。已传到 ${repoLabel} ${okCount} 个，${failCount} 个失败，剩余 ${left} 个没有上传`;
+    }else{
+      summary = failCount === 0
+        ? `批量上传完成：${okCount} 个全部成功（${repoLabel}）`
+        : `批量上传完成：${okCount} 个成功，${failCount} 个失败（失败原因见上方对应记录）`;
+    }
     addLogItem('sum'+Math.random(), batchName, summary, cls, 'summary');
   };
 }
