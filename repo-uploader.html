@@ -677,7 +677,7 @@ async function uploadOne(path, arrayBuffer, noteExtra){
       }
     }
     const body = {
-      message: `上传 ${path}（手机直传工具）`,
+      message: `上传 ${path}`,
       content: arrayBufferToBase64(arrayBuffer),
       branch: state.branch
     };
