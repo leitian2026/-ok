@@ -423,7 +423,7 @@ function computeOverlap(items, singleTop){
     if(HEAVY_DIR_PATTERN.test(i.name)) continue;
     total++;
     if(state.pathSet.has(i.name)) asIs++;
-    if(prefix){
+    if(prefix && i.name.startsWith(prefix)){
       const s = i.name.slice(prefix.length);
       if(s && state.pathSet.has(s)) stripped++;
     }
@@ -1106,6 +1106,43 @@ function detectSingleTop(items){
   return (tops.size === 1 && allNested) ? [...tops][0] : null;
 }
 
+// 根据当前分支的文件结构，找"去掉哪一段目录前缀后，包里的文件最能对上仓库已有文件"。
+// 只在证据充分时才返回前缀（否则返回 null，完全走原来的逻辑）：
+//  - 去掉前缀后至少能对上 2 个仓库已有文件（README、.gitignore 这类通用文件不算证据），并且
+//  - 比"不去前缀、按原路径"能对上的文件更多。
+// 返回前缀（不带结尾斜杠，可以是多层，如 "files" 或 "proj/files"），或 null。
+function detectPrefixByRepo(items){
+  if(state.pathSet.size === 0) return null; // 空仓库 / 空分支：没有任何依据
+  const real = items.filter(i => !HEAVY_DIR_PATTERN.test(i.name));
+  let asIs = 0;
+  for(const i of real){ if(state.pathSet.has(i.name)) asIs++; }
+  const dirs = new Set();
+  for(const i of real){
+    const parts = i.name.split('/');
+    for(let k = 1; k < parts.length; k++) dirs.add(parts.slice(0, k).join('/'));
+  }
+  let best = null, bestScore = 0;
+  for(const dir of dirs){
+    const pre = dir + '/';
+    let matches = 0, evidence = 0;
+    for(const i of real){
+      if(!i.name.startsWith(pre)) continue;
+      const rest = i.name.slice(pre.length);
+      if(rest && state.pathSet.has(rest)){
+        matches++;
+        if(!ROOT_MARKER_PATTERN.test(rest)) evidence++;
+      }
+    }
+    if(evidence < 2 || matches <= asIs) continue;
+    // 对上得最多的赢；一样多时取更短的前缀（更保守）
+    if(matches > bestScore || (matches === bestScore && best !== null && dir.length < best.length)){
+      best = dir;
+      bestScore = matches;
+    }
+  }
+  return best;
+}
+
 // 项目根目录里常见的标志文件：去掉外壳后，如果有多个这类文件落在根目录，说明那层确实是外壳
 const ROOT_MARKER_PATTERN = /^(settings\.gradle(\.kts)?|build\.gradle(\.kts)?|gradle\.properties|package\.json|pom\.xml|Cargo\.toml|go\.mod|pyproject\.toml|requirements\.txt|Dockerfile|README(\.md)?|index\.html|\.gitignore|\.github\/.+)$/i;
 
@@ -1116,7 +1153,7 @@ function decideStrip(items, singleTop, batchName){
   let asIs = 0, stripped = 0, markers = 0;
   for(const i of items){
     if(state.pathSet.has(i.name)) asIs++;
-    const s = i.name.slice(prefix.length);
+    const s = i.name.startsWith(prefix) ? i.name.slice(prefix.length) : '';
     if(s && state.pathSet.has(s)) stripped++;
     if(s && ROOT_MARKER_PATTERN.test(s)) markers++;
   }
@@ -1150,7 +1187,7 @@ async function hashExistingItems(items, singleTop){
   const need = items.filter(i=>{
     if(HEAVY_DIR_PATTERN.test(i.name)) return false;
     if(state.pathSet.has(i.name)) return true;
-    return !!singleTop && state.pathSet.has(i.name.slice(singleTop.length + 1));
+    return !!singleTop && i.name.startsWith(singleTop + '/') && state.pathSet.has(i.name.slice(singleTop.length + 1));
   });
   if(!need.length) return;
   const el = addLogItem('h'+Math.random(), '正在比对', `正在和仓库里已有的 ${need.length} 个同路径文件比对内容…`, 'pending');
@@ -1169,13 +1206,17 @@ async function prepareBatch(batchName, rawItems, icon, sourceLabel){
     return;
   }
   const snap = snapshotRepo();
-  const singleTop = detectSingleTop(items);
+  let singleTop = detectSingleTop(items);
+  // 有充分证据时（去掉某段前缀后明显更能对上当前分支的文件），用这段前缀，哪怕包里不止一个顶层条目
+  const evidencePrefix = detectPrefixByRepo(items);
+  if(evidencePrefix) singleTop = evidencePrefix;
   await hashExistingItems(items, singleTop);
   if(!sameRepo(snap)){
     addLogItem('b'+Math.random(), batchName, '处理期间仓库被切换了，这个包的预览已作废，请重新选择', 'err');
     return;
   }
   const stripInfo = decideStrip(items, singleTop, batchName);
+  if(stripInfo) stripInfo.evidence = !!evidencePrefix;
   const overlap = computeOverlap(items, singleTop);
   renderBatchPreview(batchName, items, singleTop, junkCount, icon, sourceLabel, stripInfo, snap, overlap);
 }
@@ -1284,8 +1325,13 @@ async function handleDataTransfer(dataTransfer){
 function computeBatchTargets(items, singleTop, strip){
   return items.map(item=>{
     let p = item.name;
+    let outside = false;
     if(strip && singleTop){
-      p = p.slice(singleTop.length + 1);
+      if(p.startsWith(singleTop + '/')){
+        p = p.slice(singleTop.length + 1);
+      }else{
+        outside = true; // 不在被去掉的前缀里（如包根目录的 README、补丁文件）
+      }
     }
     const invalid = hasPathTraversal(p) || !p;
     const size = item.size;
@@ -1302,8 +1348,10 @@ function computeBatchTargets(items, singleTop, strip){
       heavy,
       large,
       unchanged,
-      // 默认勾选：路径合法，不是疑似构建产物/依赖缓存目录，且内容和仓库里的不一样
-      defaultChecked: !invalid && !heavy && !unchanged
+      outside,
+      // 默认勾选：路径合法，不是疑似构建产物/依赖缓存目录，且内容和仓库里的不一样；
+      // 在被去掉的前缀之外的文件默认不传（仍可手动勾选）
+      defaultChecked: !invalid && !heavy && !unchanged && !outside
     };
   });
 }
@@ -1354,6 +1402,7 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
     }
     const tags = [];
     tags.push(t.unchanged ? '⏭️无变化' : (t.exists ? '📝覆盖' : '🆕新建'));
+    if(t.outside) tags.push('📎在前缀之外·默认不传');
     if(t.heavy) tags.push('⚠️疑似构建产物/缓存目录');
     if(t.large) tags.push(`⚠️${formatBytes(t.size)}，可能超出GitHub单文件上传限制`);
     const sizeStr = t.size != null ? `<span style="opacity:.6;"> (${formatBytes(t.size)})</span>` : '';
@@ -1366,7 +1415,7 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
   const stripCheckboxHtml = singleTop
     ? `<label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-soft);margin:8px 0;">
          <input type="checkbox" class="strip-top" ${stripInfo && stripInfo.strip ? 'checked' : ''}>
-         检测到最外层文件夹「${escapeHtml(singleTop)}/」，去掉这层，内容直接放到目标目录下
+         检测到${stripInfo && stripInfo.evidence ? '多余的目录前缀' : '最外层文件夹'}「${escapeHtml(singleTop)}/」，去掉这层，内容直接放到目标目录下
        </label>
        <div class="note" style="margin:-4px 0 8px;">${escapeHtml(stripInfo ? stripInfo.reason : '')}</div>`
     : '';
@@ -1423,9 +1472,12 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
     checkedState = currentTargets.map(t => t.defaultChecked);
     listEl.innerHTML = renderList(currentTargets);
     const nUnchanged = currentTargets.filter(t => t.unchanged).length;
-    el.querySelector('.unchanged-note').textContent = nUnchanged
-      ? `其中 ${nUnchanged} 个和仓库里的内容完全一样（标「⏭️无变化」），已默认取消勾选，不会重复上传；其余 ${currentTargets.length - nUnchanged} 个有变化或是新文件`
-      : '';
+    const nOutside = currentTargets.filter(t => t.outside).length;
+    el.querySelector('.unchanged-note').textContent =
+      (nUnchanged
+        ? `其中 ${nUnchanged} 个和仓库里的内容完全一样（标「⏭️无变化」），已默认取消勾选，不会重复上传；其余 ${currentTargets.length - nUnchanged} 个有变化或是新文件`
+        : '')
+      + (nOutside ? `${nUnchanged ? '。' : ''}另有 ${nOutside} 个文件不在这个前缀里（如包根目录的 README、补丁），已默认取消勾选` : '');
     updateConfirmLabel();
   }
   refresh();
