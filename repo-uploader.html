@@ -318,12 +318,18 @@
     <div class="log" id="repoList" style="margin-bottom:14px;"></div>
     <label class="field">分支</label>
     <input type="text" id="inBranch" placeholder="main" value="main">
+    <button class="ghost" onclick="browseBranches()" style="margin:-6px 0 14px;">浏览这个仓库的分支（任意分支都可以，也可以直接手输）</button>
+    <div class="log" id="branchList" style="margin-bottom:14px;"></div>
     <button class="primary" onclick="saveSettings()">连接并读取仓库结构</button>
     <div class="status-line" id="settingsStatus"></div>
   </div>
 
   <!-- 上传区 -->
   <div class="card hidden" id="uploadCard">
+    <div class="hidden" id="branchBar" style="margin-bottom:12px;">
+      <label class="field" for="quickBranch">上传到分支（可随时切换）</label>
+      <select id="quickBranch" class="path-select mono" style="margin-bottom:0;" onchange="switchBranch(this.value)"></select>
+    </div>
     <div class="drop" id="dropZone" onclick="document.getElementById('fileInput').click()">
       <div class="big">选择文件上传</div>
       <div class="small">支持任意文件、任意数量，压缩包会自动展开；也可以直接拖进来（支持同时拖多个文件夹），或用下方按钮选整个文件夹</div>
@@ -513,9 +519,128 @@ async function saveSettings(){
     $('uploadCard').classList.remove('hidden');
     $('logCard').classList.remove('hidden');
     updateRepoTag();
+    refreshQuickBranches();
   }catch(e){
     statusEl.textContent = '连接失败：' + e.message;
     statusEl.style.color = 'var(--danger)';
+  }
+}
+
+// ---- 分支选择：支持仓库里的任意分支 ----
+// 读取仓库的全部分支（最多 500 个）和默认分支。只在用户点按钮 / 连接仓库时请求一次，没有轮询。
+async function listBranches(token, owner, repo){
+  const headers = {'Authorization': `token ${token}`, 'Accept':'application/vnd.github+json'};
+  const getJson = async url => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(()=>controller.abort(), 20000);
+    try{
+      const res = await fetch(url, {headers, signal: controller.signal});
+      if(!res.ok){
+        let msg = res.status + ' ' + res.statusText;
+        try{ const j = await res.json(); if(j.message) msg = j.message; }catch(e){}
+        throw new Error(msg);
+      }
+      return await res.json();
+    }catch(e){
+      if(e.name === 'AbortError') throw new Error('网络请求超时，请检查网络后重试');
+      throw e;
+    }finally{
+      clearTimeout(timeoutId);
+    }
+  };
+  const base = `https://api.github.com/repos/${owner}/${repo}`;
+  const info = await getJson(base);
+  const def = info.default_branch || '';
+  let names = [];
+  for(let page = 1; page <= 5; page++){
+    const part = await getJson(`${base}/branches?per_page=100&page=${page}`);
+    if(!Array.isArray(part)) break;
+    names = names.concat(part.map(b => b.name));
+    if(part.length < 100) break;
+  }
+  // 默认分支排第一，其余保持 GitHub 返回的顺序
+  if(def && names.includes(def)) names = [def, ...names.filter(n => n !== def)];
+  return {names, def};
+}
+
+// 设置面板里的"浏览分支"：点一行就填进分支输入框
+async function browseBranches(){
+  const token = $('inToken').value.trim();
+  const repoFull = $('inRepo').value.trim();
+  const listEl = $('branchList');
+  if(!token || !repoFull.includes('/')){
+    listEl.innerHTML = '<div class="log-item err"><div class="icon">❌</div><div class="body"><div class="note">先填 Token 和 owner/repo 再浏览分支</div></div></div>';
+    return;
+  }
+  listEl.innerHTML = '<div class="log-item pending"><div class="icon">⏳</div><div class="body"><div class="note">正在读取分支列表…</div></div></div>';
+  try{
+    const [owner, repo] = repoFull.split('/');
+    const {names, def} = await listBranches(token, owner, repo);
+    if(!names.length){
+      listEl.innerHTML = '<div class="log-item err"><div class="icon">❌</div><div class="body"><div class="note">这个仓库还没有任何分支</div></div></div>';
+      return;
+    }
+    listEl.innerHTML = '';
+    names.forEach(n=>{
+      const el = document.createElement('div');
+      el.className = 'log-item ok';
+      el.style.cursor = 'pointer';
+      el.innerHTML = `<div class="icon">🌿</div><div class="body"><div class="path mono">${escapeHtml(n)}</div><div class="note">${n === def ? '默认分支' : '点击选择'}</div></div>`;
+      el.onclick = ()=>{
+        $('inBranch').value = n;
+        listEl.innerHTML = '';
+      };
+      listEl.appendChild(el);
+    });
+  }catch(e){
+    listEl.innerHTML = `<div class="log-item err"><div class="icon">❌</div><div class="body"><div class="note">读取失败：${escapeHtml(e.message)}</div></div></div>`;
+  }
+}
+
+// 上传页顶部的分支下拉框：连接成功后读取一次分支列表；读取失败就隐藏，仍可去设置里手输
+async function refreshQuickBranches(){
+  const bar = $('branchBar'), sel = $('quickBranch');
+  const snap = snapshotRepo();
+  try{
+    const {names, def} = await listBranches(state.token, state.owner, state.repo);
+    if(!sameRepo(snap)) return; // 读取期间已经切走了
+    const list = names.includes(state.branch) ? names : [state.branch, ...names];
+    sel.innerHTML = list.map(n =>
+      `<option value="${escapeHtml(n)}"${n === state.branch ? ' selected' : ''}>${escapeHtml(n)}${n === def ? '（默认）' : ''}</option>`
+    ).join('');
+    bar.classList.remove('hidden');
+  }catch(e){
+    bar.classList.add('hidden');
+  }
+}
+
+// 在上传页直接切换分支：重新读取该分支的文件结构，路径匹配按新分支算
+async function switchBranch(name){
+  const sel = $('quickBranch');
+  const status = $('uploadStatus');
+  if(!name || name === state.branch) return;
+  if(state.activeUploads > 0){
+    sel.value = state.branch;
+    status.textContent = '还有文件正在上传，等上传完成后再切换分支';
+    return;
+  }
+  const prev = state.branch;
+  sel.disabled = true;
+  state.branch = name;
+  invalidatePendingCards(); // 待确认卡片的路径是按旧分支算的，作废
+  status.textContent = `正在读取分支 ${name} 的文件结构…`;
+  try{
+    await fetchTree();
+    persistSettings();
+    updateRepoTag();
+    status.textContent = `已切换到分支 ${name}，该分支共有 ${state.pathSet.size} 个文件`;
+  }catch(e){
+    state.branch = prev;
+    sel.value = prev;
+    status.textContent = `切换失败：${e.message}（已保持在分支 ${prev}）`;
+    try{ await fetchTree(); }catch(e2){}
+  }finally{
+    sel.disabled = false;
   }
 }
 
@@ -1444,6 +1569,7 @@ window.addEventListener('beforeunload', (e)=>{
       $('logCard').classList.remove('hidden');
       $('settingsCard').classList.add('hidden');
       updateRepoTag();
+      refreshQuickBranches();
     }).catch(e=>{
       showSettings();
       $('settingsStatus').textContent = '自动连接失败：' + e.message;
