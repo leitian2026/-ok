@@ -204,6 +204,10 @@
   .log-item.ok{border-color:color-mix(in srgb, var(--ok) 40%, var(--line));}
   .log-item.err{border-color:color-mix(in srgb, var(--danger) 45%, var(--line));}
   .log-item.pending{opacity:.6;}
+  .log-item.prog{opacity:1;}
+  .log-item.prog .bar{height:8px; border-radius:6px; background:var(--line); overflow:hidden; margin:8px 0 4px;}
+  .log-item.prog .bar i{display:block; height:100%; width:0; background:var(--teal-deep); transition:width .15s;}
+  .commit-msg{width:100%; box-sizing:border-box; margin:0 0 8px;}
   /* 批量上传完成的汇总条：和单个文件的记录区分开 */
   .log-item.summary{
     align-items:center;
@@ -354,6 +358,7 @@ let state = {
   token:'', owner:'', repo:'', branch:'main',
   pathSet:new Set(),          // 仓库里已存在的完整路径
   pathShaMap:new Map(),       // path -> sha
+  pathModeMap:new Map(),      // path -> git file mode (100644 / 100755)
   basenameMap:new Map(),      // 文件名(不含目录) -> [完整路径,...]
   activeUploads:0,            // 正在进行中的上传请求数（用于刷新前警告）
 };
@@ -702,6 +707,7 @@ async function gitBlobSha1(arrayBuffer){
 async function fetchTree(){
   state.pathSet = new Set();
   state.pathShaMap = new Map();
+  state.pathModeMap = new Map();
   state.basenameMap = new Map();
   let data;
   try{
@@ -717,6 +723,7 @@ async function fetchTree(){
     if(item.type !== 'blob') return;
     state.pathSet.add(item.path);
     state.pathShaMap.set(item.path, item.sha);
+    state.pathModeMap.set(item.path, item.mode || '100644');
     const base = item.path.split('/').pop();
     if(!state.basenameMap.has(base)) state.basenameMap.set(base, []);
     state.basenameMap.get(base).push(item.path);
@@ -780,6 +787,97 @@ function updateLogItem(el, statusText, cls){
 }
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---- 批量上传：一个压缩包 = 一个提交（Git Data API：blob → tree → commit → ref）----
+// 只有最后一步才会移动分支，所以不会出现"传到一半"的状态，也不会因为连续提交而冲突。
+const GH_REPO = () => `https://api.github.com/repos/${state.owner}/${state.repo}`;
+const GH_BRANCH_PATH = () => state.branch.split('/').map(encodeURIComponent).join('/');
+function ghJson(url, method, obj){
+  return ghFetch(url, {method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj)});
+}
+async function runPool(items, limit, fn){
+  let next = 0, failed = false;
+  const worker = async () => {
+    while(!failed && next < items.length){
+      const idx = next++;
+      try{ await fn(items[idx], idx); }catch(e){ failed = true; throw e; }
+    }
+  };
+  await Promise.all(Array.from({length: Math.min(limit, items.length)}, worker));
+}
+function createProgress(name, total){
+  const el = document.createElement('div');
+  el.className = 'log-item pending prog';
+  el.innerHTML = `<div class="icon">⏳</div><div class="body"><div class="path mono"></div>
+    <div class="note main"></div><div class="bar"><i></i></div><div class="note cur"></div></div>`;
+  el.querySelector('.path').textContent = name;
+  $('log').prepend(el);
+  return {
+    total,
+    update(done, mainText, cur){
+      el.querySelector('.main').textContent = mainText;
+      el.querySelector('.bar i').style.width = (total ? Math.round(done / total * 100) : 0) + '%';
+      el.querySelector('.cur').textContent = cur || '';
+    },
+    remove(){ el.remove(); }
+  };
+}
+// 抛出 err.fallback = true 表示这个仓库还没有任何提交（空仓库），调用方改用逐文件上传
+async function commitBatchSingle(files, message, prog, stillSameRepo){
+  const total = files.length;
+  let head;
+  try{
+    const ref = await ghFetch(`${GH_REPO()}/git/ref/heads/${GH_BRANCH_PATH()}`);
+    head = ref.object.sha;
+  }catch(e){
+    if((e.status === 409 || e.status === 404) && state.pathSet.size === 0){ e.fallback = true; }
+    throw e;
+  }
+
+  // 1) 并行上传文件内容（blob），此时分支不动
+  const blobs = new Array(total);
+  let done = 0;
+  prog.update(0, `共 ${total} 个文件，已上传 0 / ${total}`, '');
+  await runPool(files, 4, async (f, idx) => {
+    if(!stillSameRepo()) throw new Error('上传中途仓库被切换，已中止（分支没有被改动）');
+    const r = await ghJson(`${GH_REPO()}/git/blobs`, 'POST', {content: arrayBufferToBase64(f.content), encoding:'base64'});
+    blobs[idx] = r.sha;
+    done++;
+    prog.update(done, `共 ${total} 个文件，已上传 ${done} / ${total}`, f.path);
+  });
+  if(!stillSameRepo()) throw new Error('上传中途仓库被切换，已中止（分支没有被改动）');
+
+  // 2) 建目录树 + 提交 + 移动分支。别人在这期间推了新提交时（分支不是快进），
+  //    重新读取最新提交，在它上面重建一次（blob 已经在 GitHub 上，很快）。
+  for(let attempt = 0; attempt < 4; attempt++){
+    prog.update(total, `共 ${total} 个文件已上传，正在创建提交…`, '');
+    const baseCommit = await ghFetch(`${GH_REPO()}/git/commits/${head}`);
+    const tree = await ghJson(`${GH_REPO()}/git/trees`, 'POST', {
+      base_tree: baseCommit.tree.sha,
+      tree: files.map((f, i) => ({path: f.path, mode: state.pathModeMap.get(f.path) || '100644', type:'blob', sha: blobs[i]}))
+    });
+    const commit = await ghJson(`${GH_REPO()}/git/commits`, 'POST', {message, tree: tree.sha, parents: [head]});
+    prog.update(total, `共 ${total} 个文件已上传，正在更新分支…`, '');
+    try{
+      await ghJson(`${GH_REPO()}/git/refs/heads/${GH_BRANCH_PATH()}`, 'PATCH', {sha: commit.sha, force: false});
+    }catch(e){
+      if(e.status === 422 && attempt < 3){
+        const ref = await ghFetch(`${GH_REPO()}/git/ref/heads/${GH_BRANCH_PATH()}`);
+        head = ref.object.sha;
+        continue;
+      }
+      throw e;
+    }
+    files.forEach((f, i) => {
+      state.pathShaMap.set(f.path, blobs[i]);
+      state.pathSet.add(f.path);
+      const base = f.path.split('/').pop();
+      if(!state.basenameMap.has(base)) state.basenameMap.set(base, []);
+      if(!state.basenameMap.get(base).includes(f.path)) state.basenameMap.get(base).push(f.path);
+    });
+    return commit.sha;
+  }
 }
 
 // ---- 上传核心 ----
@@ -1439,6 +1537,8 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
       <div class="zip-target-list"></div>
       <div class="ambiguous">
         <div class="note stale-note" style="color:var(--danger);font-weight:700;display:none;margin-bottom:8px;"></div>
+        <div class="note" style="margin-top:6px;">提交信息（整个压缩包是一个提交）：</div>
+        <input type="text" class="commit-msg" value="">
         <button class="confirm-btn confirm-batch">确认上传已勾选的文件</button>
         <button class="ghost cancel-batch" style="margin-top:8px;">取消</button>
       </div>
@@ -1450,6 +1550,8 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
   const listEl = el.querySelector('.zip-target-list');
   const checkbox = el.querySelector('.strip-top');
   const confirmBtn = el.querySelector('.confirm-batch');
+  const msgInput = el.querySelector('.commit-msg');
+  msgInput.value = `上传 ${String(batchName).replace(/\.zip$/i, '')}`;
   let currentTargets = [];
   let checkedState = []; // 与 currentTargets 下标对应的 boolean 数组
 
@@ -1503,28 +1605,59 @@ function renderBatchPreview(batchName, items, singleTop, junkCount, icon, source
       return;
     }
     const toUpload = currentTargets.filter((t, idx) => checkedState[idx] && !t.invalid);
+    const commitMsg = (msgInput.value || '').trim() || `上传 ${batchName}`;
     el.remove();
-    let okCount = 0, failCount = 0, aborted = false;
-    for(const t of toUpload){
-      if(!sameRepo(snap)){ aborted = true; break; }
-      const content = await t.item.getData();
-      // 读文件期间也可能被切换仓库，上传前再确认一次
-      if(!sameRepo(snap)){ aborted = true; break; }
-      const note = t.exists ? `覆盖（${sourceLabel}结构确认）` : `新建（${sourceLabel}结构确认）`;
-      const ok = await uploadOne(t.path, content, note);
-      if(ok) okCount++; else failCount++;
+    const n = toUpload.length;
+    const prog = createProgress(batchName, n);
+    state.activeUploads++;
+    let okCount = 0, failCount = 0, aborted = false, summary = '', cls = 'ok';
+    try{
+      // 先把要传的文件内容全部读出来
+      const files = [];
+      for(let i = 0; i < n; i++){
+        if(!sameRepo(snap)){ aborted = true; break; }
+        const t = toUpload[i];
+        prog.update(i, `共 ${n} 个文件，正在读取 ${i + 1} / ${n}`, t.path);
+        files.push({path: t.path, content: await t.item.getData(), exists: t.exists});
+      }
+      if(aborted){
+        summary = `已中止：读取文件期间仓库被切换。没有上传任何文件（${repoLabel}）`;
+        cls = 'err';
+      }else{
+        try{
+          const sha = await commitBatchSingle(files, commitMsg, prog, () => sameRepo(snap));
+          okCount = n;
+          summary = `批量上传完成：${n} 个文件，1 个提交 ${String(sha).slice(0, 7)}（${repoLabel} / ${snap.branch || state.branch}）`;
+        }catch(e){
+          if(e.fallback){
+            // 空仓库：还没有任何提交，只能逐个文件创建（第一个文件会创建分支）
+            for(let i = 0; i < files.length; i++){
+              if(!sameRepo(snap)){ aborted = true; break; }
+              prog.update(i, `空仓库，逐个上传：共 ${n} 个，现在第 ${i + 1} 个`, files[i].path);
+              const ok = await uploadOne(files[i].path, files[i].content, files[i].exists ? '覆盖' : '新建');
+              if(ok) okCount++; else failCount++;
+            }
+            summary = aborted
+              ? `已中止：上传中途仓库被切换。已传 ${okCount} 个，${failCount} 个失败，剩余 ${n - okCount - failCount} 个没有上传`
+              : (failCount === 0 ? `批量上传完成：${okCount} 个全部成功（${repoLabel}）`
+                                  : `批量上传完成：${okCount} 个成功，${failCount} 个失败（失败原因见上方对应记录）`);
+            cls = (failCount === 0 && !aborted) ? 'ok' : 'err';
+          }else{
+            failCount = n;
+            summary = `上传失败，整包没有生效（分支没有被改动）：${e.message}`;
+            cls = 'err';
+          }
+        }
+      }
+    }catch(e){
+      failCount = n;
+      summary = `上传失败：${e.message}`;
+      cls = 'err';
+    }finally{
+      state.activeUploads--;
+      prog.remove();
     }
     if(okCount > 0 && !/^拖放的 /.test(batchName)) setZipRepo(batchName, repoLabel);
-    const cls = (failCount === 0 && !aborted) ? 'ok' : 'err';
-    let summary;
-    if(aborted){
-      const left = toUpload.length - okCount - failCount;
-      summary = `已中止：上传中途仓库被切换。已传到 ${repoLabel} ${okCount} 个，${failCount} 个失败，剩余 ${left} 个没有上传`;
-    }else{
-      summary = failCount === 0
-        ? `批量上传完成：${okCount} 个全部成功（${repoLabel}）`
-        : `批量上传完成：${okCount} 个成功，${failCount} 个失败（失败原因见上方对应记录）`;
-    }
     addLogItem('sum'+Math.random(), batchName, summary, cls, 'summary');
   };
 }
